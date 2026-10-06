@@ -14,7 +14,7 @@ import course_management as cm
 import user_management as um
 
 # ==================== 配置 ====================
-PASSWORD = os.environ.get("SCORE_TRACKER_PASSWORD", "0307")
+PASSWORD = os.environ.get("SCORE_TRACKER_PASSWORD", "")
 DAY_START, DAY_END = "08:00", "20:30"   # 课程表/空闲时间统计的工作时段
 SUBJECTS = ["数学", "物理", "其他"]
 REASONS = ["计算错误", "概念不清", "审题失误", "方法不会", "没时间", "粗心抄错", "其他"]

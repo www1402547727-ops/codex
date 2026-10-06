@@ -177,11 +177,9 @@ def init_user_db(db_path: str | Path | None = None, default_teacher_password: st
             conn.execute("SELECT COUNT(*) FROM users WHERE role=?", (ROLE_TEACHER,)).fetchone()[0]
         )
         if teacher_count == 0:
-            initial_password = (
-                default_teacher_password
-                or os.environ.get("SCORE_TRACKER_PASSWORD")
-                or "0307"
-            )
+            initial_password = default_teacher_password or os.environ.get("SCORE_TRACKER_PASSWORD")
+            if not initial_password:
+                raise RuntimeError("首次初始化老师账号时必须设置 SCORE_TRACKER_PASSWORD")
             conn.execute(
                 """INSERT INTO users
                    (username, password_hash, role, active, must_change_password, created_at, note)
