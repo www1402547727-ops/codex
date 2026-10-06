@@ -61,16 +61,16 @@ table.wk td.done {background:#7C93C9; color:#fff; font-weight:600;}
 _PWA_SCRIPT = """
 <script>
 (function () {
-  var w = window;
+  var top = window;
   for (var i = 0; i < 6; i++) {
     try {
-      if (w.parent && w.parent !== w && w.parent.document) { w = w.parent; } else { break; }
+      if (top.parent && top.parent !== top && top.parent.document) { top = top.parent; } else { break; }
     } catch (e) { break; }
   }
-  var doc = w.document;
+  var doc = top.document;
   var head = doc.head;
   if (!head) { return; }
-  var base = w.location.origin + "/app/static/";
+  var origin = top.location.origin;
   function meta(name, content) {
     if (!head.querySelector('meta[name="' + name + '"]')) {
       var m = doc.createElement("meta");
@@ -79,24 +79,38 @@ _PWA_SCRIPT = """
       head.appendChild(m);
     }
   }
-  function link(rel, href, sizes) {
-    if (!head.querySelector('link[rel="' + rel + '"]')) {
-      var l = doc.createElement("link");
-      l.setAttribute("rel", rel);
-      l.setAttribute("href", href);
-      if (sizes) { l.setAttribute("sizes", sizes); }
-      head.appendChild(l);
-    }
-  }
   meta("apple-mobile-web-app-capable", "yes");
   meta("mobile-web-app-capable", "yes");
   meta("apple-mobile-web-app-status-bar-style", "default");
-  meta("apple-mobile-web-app-title", "教务工作台");
-  meta("application-name", "教务工作台");
+  meta("apple-mobile-web-app-title", "\u6559\u52a1\u5de5\u4f5c\u53f0");
+  meta("application-name", "\u6559\u52a1\u5de5\u4f5c\u53f0");
   meta("theme-color", "#3B6EF5");
-  link("apple-touch-icon", base + "icon-180.png");
-  link("icon", base + "icon-192.png", "192x192");
-  link("manifest", base + "manifest.json");
+  function link(rel, href, sizes) {
+    var old = head.querySelector('link[rel="' + rel + '"]');
+    if (old) { old.setAttribute("href", href); return; }
+    var l = doc.createElement("link");
+    l.setAttribute("rel", rel);
+    l.setAttribute("href", href);
+    if (sizes) { l.setAttribute("sizes", sizes); }
+    head.appendChild(l);
+  }
+  var bases = [origin + "/~/+/app/static/", origin + "/app/static/"];
+  var idx = 0;
+  function probe() {
+    if (idx >= bases.length) { return; }
+    var base = bases[idx++];
+    fetch(base + "manifest.json", { cache: "no-store" })
+      .then(function (r) {
+        var ct = (r.headers.get("content-type") || "").toLowerCase();
+        if (r.ok && ct.indexOf("json") >= 0) {
+          link("apple-touch-icon", base + "icon-180.png");
+          link("icon", base + "icon-192.png", "192x192");
+          link("manifest", base + "manifest.json");
+        } else { probe(); }
+      })
+      .catch(function () { probe(); });
+  }
+  probe();
 })();
 </script>
 """
