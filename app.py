@@ -828,8 +828,8 @@ def tab_entry():
         wrong = st.text_input("错题题号(如 5,12,18)", o.wrong_qs if o is not None else "", key=f"w{sid}{eid}")
         reasons = st.multiselect("错因", REASONS, [x for x in (o.reasons.split(",") if o is not None and o.reasons else []) if x in REASONS], key=f"r{sid}{eid}")
         knowledge = st.text_input("涉及知识点", o.knowledge if o is not None else "", key=f"k{sid}{eid}")
-        paper = st.file_uploader("试卷照片(可多张)", type=["jpg", "jpeg", "png"], accept_multiple_files=True, key=f"p{sid}{eid}")
-        sheet = st.file_uploader("答题卡照片(可多张)", type=["jpg", "jpeg", "png"], accept_multiple_files=True, key=f"s{sid}{eid}")
+        paper = st.file_uploader("试卷照片/PDF(可多张)", type=["jpg", "jpeg", "png", "pdf"], accept_multiple_files=True, key=f"p{sid}{eid}")
+        sheet = st.file_uploader("答题卡照片/PDF(可多张)", type=["jpg", "jpeg", "png", "pdf"], accept_multiple_files=True, key=f"s{sid}{eid}")
         note = st.text_input("备注", o.note if o is not None else "", key=f"n{sid}{eid}")
         if st.button("保存这个学生的详细记录"):
             tag = f"e{eid}_s{sid}"
