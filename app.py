@@ -28,9 +28,12 @@ PHOTOS = DATA / "photos"
 DB = DATA / "scores.db"
 PHOTOS.mkdir(parents=True, exist_ok=True)
 try:
-    cloud_store.prepare_database(DB)
+    database_found = cloud_store.prepare_database(DB)
 except Exception as exc:
     st.error(f"无法读取云端数据库：{exc}")
+    st.stop()
+if cloud_store.is_cloud() and not database_found:
+    st.error("云端数据库尚未初始化。请先把本地 data/scores.db 上传到 Supabase Storage 的 database/scores.db。")
     st.stop()
 st.markdown("""
 <style>
