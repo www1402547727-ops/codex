@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from PIL import Image, ImageOps
 
 import cloud_store
@@ -54,6 +55,53 @@ table.wk td.done {background:#7C93C9; color:#fff; font-weight:600;}
 @media (max-width: 640px) {.stButton > button {width:100%;}}
 </style>
 """, unsafe_allow_html=True)
+
+
+# 把「添加到主屏幕」需要的 meta / manifest 注入到页面 <head>（iPhone、安卓通用）
+_PWA_SCRIPT = """
+<script>
+(function () {
+  var w = window;
+  for (var i = 0; i < 6; i++) {
+    try {
+      if (w.parent && w.parent !== w && w.parent.document) { w = w.parent; } else { break; }
+    } catch (e) { break; }
+  }
+  var doc = w.document;
+  var head = doc.head;
+  if (!head) { return; }
+  var base = w.location.origin + "/app/static/";
+  function meta(name, content) {
+    if (!head.querySelector('meta[name="' + name + '"]')) {
+      var m = doc.createElement("meta");
+      m.setAttribute("name", name);
+      m.setAttribute("content", content);
+      head.appendChild(m);
+    }
+  }
+  function link(rel, href, sizes) {
+    if (!head.querySelector('link[rel="' + rel + '"]')) {
+      var l = doc.createElement("link");
+      l.setAttribute("rel", rel);
+      l.setAttribute("href", href);
+      if (sizes) { l.setAttribute("sizes", sizes); }
+      head.appendChild(l);
+    }
+  }
+  meta("apple-mobile-web-app-capable", "yes");
+  meta("mobile-web-app-capable", "yes");
+  meta("apple-mobile-web-app-status-bar-style", "default");
+  meta("apple-mobile-web-app-title", "教务工作台");
+  meta("application-name", "教务工作台");
+  meta("theme-color", "#3B6EF5");
+  link("apple-touch-icon", base + "icon-180.png");
+  link("icon", base + "icon-192.png", "192x192");
+  link("manifest", base + "manifest.json");
+})();
+</script>
+"""
+
+components.html(_PWA_SCRIPT, height=0)
 
 
 # ==================== 数据库 ====================
@@ -948,5 +996,12 @@ else:
         "账号": um.page_account,
     }
 
-page = st.sidebar.radio("导航", list(PAGES), key="page")
+if cm.is_mobile():
+    st.markdown("### 教务工作台")
+    page = st.segmented_control("导航", list(PAGES), default=list(PAGES)[0], key="page", label_visibility="collapsed")
+    if not page:
+        page = list(PAGES)[0]
+    st.divider()
+else:
+    page = st.sidebar.radio("导航", list(PAGES), key="page")
 PAGES[page]()

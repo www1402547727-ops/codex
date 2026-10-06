@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import calendar
 import html
+import re
 import sqlite3
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -28,6 +29,21 @@ STATUS_OPTIONS = [STATUS_PENDING, STATUS_DONE, STATUS_LEAVE, STATUS_CANCEL]
 STATUS_ICON = {STATUS_PENDING: "🔵", STATUS_DONE: "✅", STATUS_LEAVE: "🟡", STATUS_CANCEL: "⚫", STATUS_MOVED: "↪️"}
 ACTIVE_STATUSES = (STATUS_PENDING, STATUS_DONE)
 DISPLAY_STATUSES = (STATUS_PENDING, STATUS_DONE, STATUS_LEAVE, STATUS_CANCEL)
+
+
+def is_mobile() -> bool:
+    """判断是否用手机/平板访问。电脑上想预览手机版，可在网址后面加 ?m=1。"""
+    try:
+        flag = str(st.query_params.get("m", "")).strip().lower()
+        if flag in ("1", "true", "yes", "mobile"):
+            return True
+    except Exception:
+        pass
+    try:
+        ua = str(st.context.headers.get("User-Agent", "") or "")
+    except Exception:
+        ua = ""
+    return bool(re.search(r"iPhone|iPod|iPad|Android|Windows Phone|Mobile", ua, re.I))
 
 
 class CourseValidationError(ValueError):
@@ -913,7 +929,25 @@ def _inject_css() -> None:
         table.month2 .daynum {font-weight:750;margin-bottom:3px;}
         table.month2 .mini {display:block;color:#334155;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
         .tiny-note {color:#98A2B3;font-size:.78rem;}
-        @media (max-width: 760px) {table.wk2 {font-size:9px;} table.month2 td {height:72px;padding:3px;}}
+        @media (max-width: 760px) {
+            .block-container {padding: 0.5rem 0.7rem 1.4rem !important;}
+            [data-testid="stMainBlockContainer"] {padding-top: 0.4rem !important;}
+            h1 {font-size: 1.5rem !important; line-height: 1.25 !important;}
+            h2 {font-size: 1.2rem !important;}
+            h3, h4 {font-size: 1.02rem !important;}
+            .stButton > button {min-height: 2.7rem; font-size: .95rem;}
+            [data-testid="stMetric"] {padding: 8px 10px;}
+            [data-testid="stMetricValue"] {font-size: 1.3rem;}
+            div[data-testid="stHorizontalBlock"] {gap: .45rem !important;}
+            .mday {font-weight: 700; font-size: 1rem; margin: 14px 0 6px; padding: 7px 10px;
+                   border-radius: 9px; background: #EEF3FA; color: #344054;}
+            .mday.today {background: #3B6EF5; color: #fff;}
+            .mempty {color: #98A2B3; font-size: .85rem; margin: 0 0 6px 10px;}
+            .mstats {display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 6px 0 10px;}
+            .mstat {background: #FFF; border: 1px solid #E1E6EE; border-radius: 11px; padding: 9px 11px;}
+            .mstat span {display: block; color: #667085; font-size: .8rem;}
+            .mstat b {font-size: 1.28rem; line-height: 1.2;}
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -1073,19 +1107,20 @@ def _course_card(row, key: str, show_complete: bool = True) -> None:
             f"<div class='{css_class}' style='padding:8px 10px;border-radius:8px;margin:-10px -10px 8px -10px'>",
             unsafe_allow_html=True,
         )
-        top = st.columns([7, 2.2])
+        top = st.columns(1) if is_mobile() else st.columns([7, 2.2])
+        second = top[1] if len(top) > 1 else st
         summary = f"{row['start']}–{row['end']}　{row['target_name']} · {row['subject'] or '未填科目'}"
         if top[0].button(summary, key=f"edit_{key}_{row['id']}", use_container_width=True):
             _set_dialog(int(row["id"]))
         if show_complete and status == STATUS_PENDING:
-            if top[1].button("✓ 已上课", key=f"done_{key}_{row['id']}", type="primary", use_container_width=True):
+            if second.button("✓ 已上课", key=f"done_{key}_{row['id']}", type="primary", use_container_width=True):
                 changed = complete_course(int(row["id"]))
                 if changed and row["target_type"] == TARGET_ONE:
                     st.toast("已记录上课，自动扣除 1 课时")
                 elif changed:
                     st.toast("已记录上课")
                 st.rerun()
-        elif top[1].button("编辑", key=f"editbtn_{key}_{row['id']}", use_container_width=True):
+        elif second.button("编辑", key=f"editbtn_{key}_{row['id']}", use_container_width=True):
             _set_dialog(int(row["id"]))
         meta = [
             TYPE_LABELS.get(row["target_type"], row["target_type"]),
@@ -1145,30 +1180,54 @@ def _week_grid_html(ws: date) -> str:
     return "".join(out)
 
 
+def _week_list(ws: date) -> None:
+    """手机版：按天纵向列出本周课程，点课程即可编辑。"""
+    days = [ws + timedelta(i) for i in range(7)]
+    courses = _courses_between(days[0], days[-1])
+    for idx, day in enumerate(days):
+        group = courses[courses["plan_date"].map(lambda v: _as_date(v) == day)]
+        is_today = day == date.today()
+        st.markdown(
+            f"<div class='mday{' today' if is_today else ''}'>{WD[idx]} {day.month}/{day.day}"
+            f"{' · 今天' if is_today else ''}</div>",
+            unsafe_allow_html=True,
+        )
+        active = group[group["status"].isin(ACTIVE_STATUSES)]
+        if active.empty:
+            st.markdown("<div class='mempty'>无课</div>", unsafe_allow_html=True)
+        for _, row in active.iterrows():
+            _course_card(row, f"mweek{idx}")
+        for _, row in group[~group["status"].isin(ACTIVE_STATUSES)].iterrows():
+            _course_card(row, f"mweekx{idx}", show_complete=False)
+
+
 def _render_week(ws: date) -> None:
     we = ws + timedelta(days=6)
     st.caption(f"{ws.year}年{ws.month}月{ws.day}日 – {we.month}月{we.day}日")
-    st.markdown(_week_grid_html(ws), unsafe_allow_html=True)
-    st.caption("按星期和时间查看；蓝色待上课，灰蓝已上课，👤 表示一对一。")
     st.markdown("#### 本周课程（点击课程即可编辑）")
-    days = [ws + timedelta(i) for i in range(7)]
-    columns = st.columns(7, gap="small")
-    for idx, day in enumerate(days):
-        with columns[idx]:
-            st.markdown(
-                f"<div style='text-align:center;padding:6px;border-radius:8px;"
-                f"background:{'#3B6EF5' if day == date.today() else '#EEF3FA'};"
-                f"color:{'white' if day == date.today() else '#344054'};font-weight:700'>"
-                f"{WD[idx]}<br><span style='font-size:.84rem'>{day.month}/{day.day}</span></div>",
-                unsafe_allow_html=True,
-            )
-            df = _courses_between(day, day)
-            if df.empty:
-                st.caption("无课程")
-            for _, row in df.iterrows():
-                label = f"{row['start']}\n{row['target_name']}\n{row['subject'] or '未填科目'}"
-                if st.button(label, key=f"week_{idx}_{row['id']}", use_container_width=True):
-                    _set_dialog(int(row["id"]))
+    if is_mobile():
+        _week_list(ws)
+    else:
+        st.markdown(_week_grid_html(ws), unsafe_allow_html=True)
+        st.caption("按星期和时间查看；蓝色待上课，灰蓝已上课，👤 表示一对一。")
+        days = [ws + timedelta(i) for i in range(7)]
+        columns = st.columns(7, gap="small")
+        for idx, day in enumerate(days):
+            with columns[idx]:
+                st.markdown(
+                    f"<div style='text-align:center;padding:6px;border-radius:8px;"
+                    f"background:{'#3B6EF5' if day == date.today() else '#EEF3FA'};"
+                    f"color:{'white' if day == date.today() else '#344054'};font-weight:700'>"
+                    f"{WD[idx]}<br><span style='font-size:.84rem'>{day.month}/{day.day}</span></div>",
+                    unsafe_allow_html=True,
+                )
+                df = _courses_between(day, day)
+                if df.empty:
+                    st.caption("无课程")
+                for _, row in df.iterrows():
+                    label = f"{row['start']}\n{row['target_name']}\n{row['subject'] or '未填科目'}"
+                    if st.button(label, key=f"week_{idx}_{row['id']}", use_container_width=True):
+                        _set_dialog(int(row["id"]))
     with st.expander("把本周课程复制到后面几周"):
         n = st.number_input("复制到接下来几周", min_value=1, max_value=26, value=4, step=1)
         if st.button("复制本周课程"):
@@ -1211,8 +1270,9 @@ def _month_grid_html(day_in_month: date) -> str:
 def _render_month(day_in_month: date) -> None:
     first, last = _month_bounds(day_in_month)
     st.caption(f"{first.year}年{first.month}月")
-    st.markdown(_month_grid_html(day_in_month), unsafe_allow_html=True)
-    st.caption("月历用于总览；下面是按日期排列的可点击课程。")
+    if not is_mobile():
+        st.markdown(_month_grid_html(day_in_month), unsafe_allow_html=True)
+        st.caption("月历用于总览；下面是按日期排列的可点击课程。")
     df = _courses_between(first, last)
     if df.empty:
         st.info("这个月还没有课程。")
@@ -1228,11 +1288,23 @@ def _render_today(day: date | None = None) -> None:
     active = df[df["status"].isin(ACTIVE_STATUSES)]
     done = int((active["status"] == STATUS_DONE).sum())
     pending = int((active["status"] == STATUS_PENDING).sum())
-    cols = st.columns(4)
-    cols[0].metric("今日课程", len(active))
-    cols[1].metric("已上课", done)
-    cols[2].metric("待上课", pending)
-    cols[3].metric("今日一对一", len(df[df["target_type"] == TARGET_ONE]))
+    if is_mobile():
+        one_n = len(df[df["target_type"] == TARGET_ONE])
+        st.markdown(
+            "<div class='mstats'>"
+            f"<div class='mstat'><span>今日课程</span><b>{len(active)}</b></div>"
+            f"<div class='mstat'><span>已上课</span><b>{done}</b></div>"
+            f"<div class='mstat'><span>待上课</span><b>{pending}</b></div>"
+            f"<div class='mstat'><span>今日一对一</span><b>{one_n}</b></div>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        cols = st.columns(4)
+        cols[0].metric("今日课程", len(active))
+        cols[1].metric("已上课", done)
+        cols[2].metric("待上课", pending)
+        cols[3].metric("今日一对一", len(df[df["target_type"] == TARGET_ONE]))
     if df.empty:
         st.info("今天没有课程。")
     else:
@@ -1259,9 +1331,13 @@ def page_home() -> None:
     day = date.today()
     st.title("今天")
     st.caption(_fmt_day(day))
-    top = st.columns([1, 5])
-    if top[0].button("＋ 新增课程", type="primary", use_container_width=True):
-        _set_dialog(None, day)
+    if is_mobile():
+        if st.button("＋ 新增课程", type="primary", use_container_width=True):
+            _set_dialog(None, day)
+    else:
+        top = st.columns([1, 5])
+        if top[0].button("＋ 新增课程", type="primary", use_container_width=True):
+            _set_dialog(None, day)
     _render_today(day)
     st.divider()
     if st.button("查看完整课程表 →"):
@@ -1273,16 +1349,27 @@ def page_home() -> None:
 def page_schedule() -> None:
     _inject_css()
     st.title("课程表 / 排课管理")
-    controls = st.columns([1.15, 2.4, 1.2])
-    if controls[0].button("＋ 新增课程", type="primary", use_container_width=True):
-        _set_dialog(None, st.session_state.get("schedule_date", date.today()))
-    view = controls[1].segmented_control(
-        "查看范围", options=["今天", "本周", "本月"], default="本周",
-        label_visibility="collapsed", key="schedule_view",
-    )
-    selected = controls[2].date_input(
-        "选择日期", value=date.today(), label_visibility="collapsed", key="schedule_date",
-    )
+    if is_mobile():
+        if st.button("＋ 新增课程", type="primary", use_container_width=True):
+            _set_dialog(None, st.session_state.get("schedule_date", date.today()))
+        view = st.segmented_control(
+            "查看范围", options=["今天", "本周", "本月"], default="本周",
+            label_visibility="collapsed", key="schedule_view",
+        )
+        selected = st.date_input(
+            "选择日期", value=date.today(), label_visibility="collapsed", key="schedule_date",
+        )
+    else:
+        controls = st.columns([1.15, 2.4, 1.2])
+        if controls[0].button("＋ 新增课程", type="primary", use_container_width=True):
+            _set_dialog(None, st.session_state.get("schedule_date", date.today()))
+        view = controls[1].segmented_control(
+            "查看范围", options=["今天", "本周", "本月"], default="本周",
+            label_visibility="collapsed", key="schedule_view",
+        )
+        selected = controls[2].date_input(
+            "选择日期", value=date.today(), label_visibility="collapsed", key="schedule_date",
+        )
     st.divider()
     if view == "今天":
         st.subheader(_fmt_day(selected))
