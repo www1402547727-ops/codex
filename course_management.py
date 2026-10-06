@@ -31,6 +31,16 @@ ACTIVE_STATUSES = (STATUS_PENDING, STATUS_DONE)
 DISPLAY_STATUSES = (STATUS_PENDING, STATUS_DONE, STATUS_LEAVE, STATUS_CANCEL)
 
 
+MOBILE_TAB_ALIAS = {"课程表": "课表", "教学对象": "教学"}
+
+
+def goto_page(name: str) -> None:
+    """统一切换页面，同时兼容手机底部标签栏和电脑侧边栏（只能在 on_click 回调里调用）。"""
+    st.session_state["mobile_extra"] = None
+    st.session_state["page"] = name
+    st.session_state["mobile_tab"] = MOBILE_TAB_ALIAS.get(name, name)
+
+
 def is_mobile() -> bool:
     """判断是否用手机/平板访问。电脑上想预览手机版，可在网址后面加 ?m=1。"""
     try:
@@ -930,7 +940,7 @@ def _inject_css() -> None:
         table.month2 .mini {display:block;color:#334155;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
         .tiny-note {color:#98A2B3;font-size:.78rem;}
         @media (max-width: 760px) {
-            .block-container {padding: 0.5rem 0.7rem 1.4rem !important;}
+            .block-container {padding: 0.5rem 0.7rem 6.5rem !important;}
             [data-testid="stMainBlockContainer"] {padding-top: 0.4rem !important;}
             h1 {font-size: 1.5rem !important; line-height: 1.25 !important;}
             h2 {font-size: 1.2rem !important;}
@@ -947,6 +957,16 @@ def _inject_css() -> None:
             .mstat {background: #FFF; border: 1px solid #E1E6EE; border-radius: 11px; padding: 9px 11px;}
             .mstat span {display: block; color: #667085; font-size: .8rem;}
             .mstat b {font-size: 1.28rem; line-height: 1.2;}
+            table.wk2.m {font-size: 10px;}
+            table.wk2.m th {padding: 4px 1px; font-size: 10px; line-height: 1.15;}
+            table.wk2.m th .d {font-size: 9px; font-weight: 500; opacity: .85;}
+            table.wk2.m th .n {font-size: 9.5px; font-weight: 750;}
+            table.wk2.m td {height: 17px; padding: 0 1px; font-size: 10px;}
+            table.wk2.m td.tm {width: 46px; font-size: 9px;}
+            table.month2.m td {height: 46px; padding: 2px 3px; text-align: center;}
+            table.month2.m .daynum {margin-bottom: 1px; font-size: .8rem;}
+            table.month2.m .mnum {color: #3B6EF5; font-weight: 750; font-size: .72rem;}
+            table.month2.m .mdone {color: #7C93C9; font-size: .66rem;}
         }
         </style>
         """,
@@ -990,8 +1010,8 @@ def _course_dialog(course_id: int | None = None):
     target_df = _class_options() if target_type == TARGET_CLASS else _one_options()
     if target_df.empty:
         st.warning("还没有可选的班级或一对一学生，请先到「教学对象」页面新增。")
-        if st.button("去新增教学对象", type="primary", use_container_width=True):
-            st.session_state.page = "教学对象"
+        if st.button("去新增教学对象", type="primary", use_container_width=True,
+                     on_click=lambda: goto_page("教学对象")):
             _close_dialog()
         return
     target_labels = {
@@ -1095,6 +1115,26 @@ def _show_dialog_if_requested() -> None:
     if "course_dialog_id" in st.session_state:
         _course_dialog(st.session_state.get("course_dialog_id"))
 
+def _course_row(row, key: str, show_complete: bool = True) -> None:
+    """手机版：一节课程占一行，点整行打开编辑弹窗。"""
+    status = str(row["status"])
+    pending = status == STATUS_PENDING
+    label = f"{row['start']}–{row['end']}　{row['target_name']} · {row['subject'] or '未填科目'}"
+    if show_complete and pending:
+        cols = st.columns([3.2, 1.8])
+        if cols[0].button(label, key=f"row_{key}_{row['id']}", use_container_width=True):
+            _set_dialog(int(row["id"]))
+        if cols[1].button("✓ 已上课", key=f"rowdone_{key}_{row['id']}", type="primary", use_container_width=True):
+            changed = complete_course(int(row["id"]))
+            if changed and row["target_type"] == TARGET_ONE:
+                st.toast("已记录上课，自动扣除 1 课时")
+            elif changed:
+                st.toast("已记录上课")
+            st.rerun()
+    elif st.button(f"{label}　{STATUS_ICON.get(status, '')}", key=f"row_{key}_{row['id']}", use_container_width=True):
+        _set_dialog(int(row["id"]))
+
+
 def _course_card(row, key: str, show_complete: bool = True) -> None:
     status = str(row["status"])
     css_class = (
@@ -1148,29 +1188,56 @@ def _render_day_cards(day: date, key: str, show_empty: bool = True) -> None:
         _course_card(row, key)
 
 
-def _week_grid_html(ws: date) -> str:
+def _week_grid_html(ws: date, mobile: bool = False) -> str:
     days = [ws + timedelta(i) for i in range(7)]
     courses = _courses_between(ws, days[-1])
     courses = courses[courses["status"].isin(ACTIVE_STATUSES)]
     cells: dict[tuple[int, int], tuple[str, str]] = {}
+    counts = [0] * 7
+    used_slots: list[int] = []
     for row in courses.itertuples():
         day_index = (_as_date(row.plan_date) - ws).days
+        if 0 <= day_index < 7:
+            counts[day_index] += 1
         start = _mins(row.start)
         first = start // 30 * 30
         for slot in range(first, max(first + 30, _mins(row.end)), 30):
-            text = (
-                f"{'👤 ' if row.target_type == TARGET_ONE else ''}"
-                f"{html.escape(str(row.target_name))} {row.start}"
-                + (" ✓" if row.status == STATUS_DONE else "")
-                if slot == first else "&nbsp;"
-            )
+            used_slots.append(slot)
+            if slot == first:
+                if mobile:
+                    subject = str(row.subject).strip() if row.subject else ""
+                    label = (subject or str(row.target_name))[:2]
+                    text = html.escape(label) + ("✓" if row.status == STATUS_DONE else "")
+                else:
+                    text = (
+                        f"{'👤 ' if row.target_type == TARGET_ONE else ''}"
+                        f"{html.escape(str(row.target_name))} {row.start}"
+                        + (" ✓" if row.status == STATUS_DONE else "")
+                    )
+            else:
+                text = "&nbsp;"
             css = "done" if row.status == STATUS_DONE else "busy"
             cells[(day_index, slot)] = (css, text)
-    out = ["<table class='wk2'><tr><th style='width:48px'></th>"]
+
+    lo, hi = _mins(DAY_START), _mins(DAY_END)
+    if mobile and used_slots:
+        lo = max(_mins(DAY_START), min(used_slots) - 30)
+        hi = min(_mins(DAY_END) + 60, max(used_slots) + 90)
+
+    out = ["<table class='wk2" + (" m" if mobile else "") + "'><tr><th style='width:46px'></th>"]
     for i, day in enumerate(days):
-        out.append(f"<th class='{'today' if day == date.today() else ''}'>{WD[i]}<br>{day.month}/{day.day}</th>")
+        cls = "today" if day == date.today() else ""
+        if mobile:
+            n = counts[i]
+            out.append(
+                f"<th class='{cls}'>{WD[i]}<br>"
+                f"<span class='d'>{day.month}/{day.day}</span><br>"
+                f"<span class='n'>{str(n) + '节' if n else '·'}</span></th>"
+            )
+        else:
+            out.append(f"<th class='{cls}'>{WD[i]}<br>{day.month}/{day.day}</th>")
     out.append("</tr>")
-    for slot in range(_mins(DAY_START), _mins(DAY_END), 30):
+    for slot in range(lo, hi, 30):
         out.append(f"<tr><td class='tm'>{_hm(slot) if slot % 60 == 0 else ''}</td>")
         for i in range(7):
             cell = cells.get((i, slot))
@@ -1178,36 +1245,39 @@ def _week_grid_html(ws: date) -> str:
         out.append("</tr>")
     out.append("</table>")
     return "".join(out)
-
-
 def _week_list(ws: date) -> None:
-    """手机版：按天纵向列出本周课程，点课程即可编辑。"""
+    """手机版本周明细：按天分组，每节一行，默认展开，点整行编辑。"""
     days = [ws + timedelta(i) for i in range(7)]
     courses = _courses_between(days[0], days[-1])
     for idx, day in enumerate(days):
         group = courses[courses["plan_date"].map(lambda v: _as_date(v) == day)]
+        active = group[group["status"].isin(ACTIVE_STATUSES)]
         is_today = day == date.today()
+        if active.empty:
+            st.markdown(
+                f"<div class='mempty'>{WD[idx]} {day.month}/{day.day} · 无课</div>",
+                unsafe_allow_html=True,
+            )
+            continue
         st.markdown(
             f"<div class='mday{' today' if is_today else ''}'>{WD[idx]} {day.month}/{day.day}"
-            f"{' · 今天' if is_today else ''}</div>",
+            f"{' · 今天' if is_today else ''} · {len(active)}节</div>",
             unsafe_allow_html=True,
         )
-        active = group[group["status"].isin(ACTIVE_STATUSES)]
-        if active.empty:
-            st.markdown("<div class='mempty'>无课</div>", unsafe_allow_html=True)
         for _, row in active.iterrows():
-            _course_card(row, f"mweek{idx}")
+            _course_row(row, f"mweek{idx}")
         for _, row in group[~group["status"].isin(ACTIVE_STATUSES)].iterrows():
-            _course_card(row, f"mweekx{idx}", show_complete=False)
-
-
+            _course_row(row, f"mweekx{idx}", show_complete=False)
 def _render_week(ws: date) -> None:
     we = ws + timedelta(days=6)
     st.caption(f"{ws.year}年{ws.month}月{ws.day}日 – {we.month}月{we.day}日")
-    st.markdown("#### 本周课程（点击课程即可编辑）")
     if is_mobile():
+        st.markdown(_week_grid_html(ws, mobile=True), unsafe_allow_html=True)
+        st.caption("格子里是科目，列头是当天课数；🟦待上课　⬜已上课")
+        st.markdown("#### 本周课程（点课程即可编辑）")
         _week_list(ws)
     else:
+        st.markdown("#### 本周课程（点击课程即可编辑）")
         st.markdown(_week_grid_html(ws), unsafe_allow_html=True)
         st.caption("按星期和时间查看；蓝色待上课，灰蓝已上课，👤 表示一对一。")
         days = [ws + timedelta(i) for i in range(7)]
@@ -1234,16 +1304,15 @@ def _render_week(ws: date) -> None:
             count = copy_week(ws, int(n))
             st.success(f"已新增 {count} 节课")
             st.rerun()
-
-
-def _month_grid_html(day_in_month: date) -> str:
+def _month_grid_html(day_in_month: date, mobile: bool = False) -> str:
     first, last = _month_bounds(day_in_month)
     courses = _courses_between(first, last)
     grouped: dict[str, list[pd.Series]] = {}
     for _, row in courses.iterrows():
         grouped.setdefault(str(row["plan_date"]), []).append(row)
     weeks = calendar.Calendar(firstweekday=0).monthdatescalendar(first.year, first.month)
-    out = ["<table class='month2'><tr>" + "".join(f"<th>{x}</th>" for x in WD) + "</tr>"]
+    out = ["<table class='month2" + (" m" if mobile else "") + "'><tr>"
+           + "".join(f"<th>{x}</th>" for x in WD) + "</tr>"]
     for week in weeks:
         out.append("<tr>")
         for day in week:
@@ -1254,23 +1323,31 @@ def _month_grid_html(day_in_month: date) -> str:
             if day.month == first.month:
                 out.append(f"<div class='daynum'>{day.day}</div>")
                 items = sorted(grouped.get(str(day), []), key=lambda x: str(x["start"]))
-                for row in items[:4]:
-                    mark = "✓" if row["status"] == STATUS_DONE else row["start"]
-                    out.append(
-                        f"<span class='mini'>{_e(mark)} {_e(row['target_name'])} {_e(row['subject'] or '')}</span>"
-                    )
-                if len(items) > 4:
-                    out.append(f"<span class='tiny-note'>另有 {len(items)-4} 节</span>")
+                if mobile:
+                    if items:
+                        done = sum(1 for r in items if r["status"] == STATUS_DONE)
+                        out.append(f"<div class='mnum'>{len(items)}节</div>")
+                        if done:
+                            out.append(f"<div class='mdone'>{done}✓</div>")
+                else:
+                    for row in items[:4]:
+                        mark = "✓" if row["status"] == STATUS_DONE else row["start"]
+                        out.append(
+                            f"<span class='mini'>{_e(mark)} {_e(row['target_name'])} {_e(row['subject'] or '')}</span>"
+                        )
+                    if len(items) > 4:
+                        out.append(f"<span class='tiny-note'>另有 {len(items)-4} 节</span>")
             out.append("</td>")
         out.append("</tr>")
     out.append("</table>")
     return "".join(out)
-
-
 def _render_month(day_in_month: date) -> None:
     first, last = _month_bounds(day_in_month)
     st.caption(f"{first.year}年{first.month}月")
-    if not is_mobile():
+    if is_mobile():
+        st.markdown(_month_grid_html(day_in_month, mobile=True), unsafe_allow_html=True)
+        st.caption("格子里的数字是当天课数；下面按日期列出，点课程即可编辑。")
+    else:
         st.markdown(_month_grid_html(day_in_month), unsafe_allow_html=True)
         st.caption("月历用于总览；下面是按日期排列的可点击课程。")
     df = _courses_between(first, last)
@@ -1278,10 +1355,23 @@ def _render_month(day_in_month: date) -> None:
         st.info("这个月还没有课程。")
         return
     for day_text, group in df.groupby("plan_date", sort=True):
-        st.markdown(f"#### {_fmt_day(_as_date(day_text))}")
-        for _, row in group.iterrows():
-            _course_card(row, "month")
-
+        day = _as_date(day_text)
+        if not is_mobile():
+            st.markdown(f"#### {_fmt_day(day)}")
+            for _, row in group.iterrows():
+                _course_card(row, "month")
+            continue
+        active = group[group["status"].isin(ACTIVE_STATUSES)]
+        if active.empty:
+            continue
+        st.markdown(
+            f"<div class='mday{' today' if day == date.today() else ''}'>{_fmt_day(day)} · {len(active)}节</div>",
+            unsafe_allow_html=True,
+        )
+        for _, row in active.iterrows():
+            _course_row(row, "month")
+        for _, row in group[~group["status"].isin(ACTIVE_STATUSES)].iterrows():
+            _course_row(row, "monthx", show_complete=False)
 def _render_today(day: date | None = None) -> None:
     day = day or date.today()
     df = _courses_between(day, day)
@@ -1309,12 +1399,12 @@ def _render_today(day: date | None = None) -> None:
         st.info("今天没有课程。")
     else:
         for _, row in active.iterrows():
-            _course_card(row, "today")
+            _course_row(row, "today") if is_mobile() else _course_card(row, "today")
         other = df[~df["status"].isin(ACTIVE_STATUSES)]
         if not other.empty:
             with st.expander("请假、取消和已调课记录"):
                 for _, row in other.iterrows():
-                    _course_card(row, "today_other", show_complete=False)
+                    _course_row(row, "today_other", show_complete=False) if is_mobile() else _course_card(row, "today_other", show_complete=False)
     overdue = query(
         COURSE_SQL + """ WHERE p.status='待上课' AND p.plan_date<? AND p.plan_date>=?
                         ORDER BY p.plan_date, p.start""",
@@ -1323,7 +1413,7 @@ def _render_today(day: date | None = None) -> None:
     if not overdue.empty:
         st.subheader("过去 30 天尚未确认的课程")
         for _, row in overdue.iterrows():
-            _course_card(row, "overdue")
+            _course_row(row, "overdue") if is_mobile() else _course_card(row, "overdue")
 
 
 def page_home() -> None:
@@ -1340,9 +1430,10 @@ def page_home() -> None:
             _set_dialog(None, day)
     _render_today(day)
     st.divider()
-    if st.button("查看完整课程表 →"):
-        st.session_state.page = "课程表"
-        st.rerun()
+    if is_mobile():
+        st.button("查看完整课程表 →", use_container_width=True, on_click=lambda: goto_page("课程表"))
+    else:
+        st.button("查看完整课程表 →", on_click=lambda: goto_page("课程表"))
     _show_dialog_if_requested()
 
 

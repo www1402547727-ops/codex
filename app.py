@@ -39,6 +39,23 @@ if cloud_store.is_cloud() and not database_found:
 st.markdown("""
 <style>
 #MainMenu, footer {visibility: hidden;}
+.st-key-bottomnav {position: fixed; left: 0; right: 0; bottom: 0; z-index: 1000;
+  background: #FFFFFF; border-top: 1px solid #E1E6EE;
+  padding: 6px 8px calc(8px + env(safe-area-inset-bottom));}
+[class*="st-key-me_quick"] [data-testid="stHorizontalBlock"],
+[class*="st-key-me_month"] [data-testid="stHorizontalBlock"] {flex-wrap: nowrap !important; width: 100% !important;}
+[class*="st-key-me_quick"] [data-testid="stColumn"],
+[class*="st-key-me_month"] [data-testid="stColumn"] {min-width: 0 !important; flex: 1 1 0 !important; width: auto !important;}
+[class*="st-key-me_quick"] .stElementContainer,
+[class*="st-key-me_month"] .stElementContainer,
+[class*="st-key-me_quick"] button,
+[class*="st-key-me_month"] button {width: 100% !important; min-width: 0 !important;}
+.st-key-bottomnav .stElementContainer,
+.st-key-bottomnav [data-testid="stButtonGroup"],
+.st-key-bottomnav [role="radiogroup"] {width: 100% !important;}
+.st-key-bottomnav [role="radiogroup"] {display: flex !important; gap: 4px !important;}
+.st-key-bottomnav button {flex: 1 1 0 !important; min-width: 0 !important;
+  font-size: .8rem !important; padding: 7px 2px !important; justify-content: center !important;}
 .block-container {padding-top: 2rem; max-width: 1100px;}
 .stButton > button {border-radius: 10px; font-weight: 600; border: 1px solid #D5DCE8;}
 [data-testid="stExpander"] {border-radius: 12px; border: 1px solid #E1E6EE; background: #FFF;}
@@ -1010,12 +1027,100 @@ else:
         "账号": um.page_account,
     }
 
-if cm.is_mobile():
-    st.markdown("### 教务工作台")
-    page = st.segmented_control("导航", list(PAGES), default=list(PAGES)[0], key="page", label_visibility="collapsed")
-    if not page:
-        page = list(PAGES)[0]
+def page_me() -> None:
+    """手机版「我的」：身份、快捷入口、待办、课时预警、本月速览、退出登录。"""
+    me = um.current_user() or {}
+    st.title("我的")
+    st.caption(f"{um.ROLE_LABELS.get(me.get('role'), '')}：{me.get('username') or ''}")
+
+    st.markdown("#### ⚡ 快捷入口")
+    with st.container(key="me_quick"):
+        for pair in (["学生", "授课统计"], ["账号管理", "账号资料"]):
+            cols = st.columns(2)
+            for col, label in zip(cols, pair):
+                target = "账号" if label == "账号资料" else label
+                if col.button(label, use_container_width=True, key=f"me_{target}"):
+                    st.session_state["mobile_extra"] = target
+                    st.rerun()
+
+    today = date.today()
+    st.markdown("#### 🔔 待办提醒")
+    overdue = int(query(
+        "SELECT COUNT(*) n FROM plans WHERE status='待上课' AND plan_date<? AND plan_date>=?",
+        (str(today), str(today - timedelta(days=30))),
+    ).n[0])
+    if overdue:
+        st.button(
+            f"⚠️ 过去 30 天有 {overdue} 节课还没确认「已上课」→ 去处理",
+            use_container_width=True, key="me_overdue",
+            on_click=lambda: st.session_state.update(mobile_extra=None, page="课程表"),
+        )
+    else:
+        st.success("没有待确认的课程")
+
+    st.markdown("#### ⏳ 课时预警")
+    try:
+        one = cm.one_to_one_summary()
+    except Exception:
+        one = pd.DataFrame()
+    if one.empty:
+        st.caption("还没有一对一学生")
+    else:
+        low = one[one["remain"].astype(float) <= 3]
+        if low.empty:
+            st.caption("暂无课时不足的学生")
+        else:
+            for r in low.itertuples():
+                st.markdown(f"- **{r.name}**：只剩 {float(r.remain):g} 课时")
+
+    st.markdown("#### 📊 本月速览")
+    month = today.strftime("%Y-%m")
+    total = int(query("SELECT COUNT(*) n FROM plans WHERE substr(plan_date,1,7)=? AND status='已上课'", (month,)).n[0])
+    one_n = int(query(
+        "SELECT COUNT(*) n FROM plans WHERE substr(plan_date,1,7)=? AND status='已上课' AND target_type='一对一'",
+        (month,),
+    ).n[0])
+    with st.container(key="me_month"):
+        mm = st.columns(2)
+        mm[0].metric("本月已授课", total)
+        mm[1].metric("其中一对一", one_n)
+
     st.divider()
+    if st.button("退出登录", use_container_width=True, key="me_logout"):
+        um.logout()
+
+
+if user["role"] == um.ROLE_TEACHER:
+    MOBILE_TABS = {"首页": "首页", "课表": "课程表", "教学": "教学对象", "成绩": "成绩", "我的": "我的"}
+    MOBILE_EXTRA = ["学生", "授课统计", "账号管理", "账号"]
+else:
+    MOBILE_TABS = {"我的课程": "我的课程", "成绩": "我的成绩", "账号": "账号"}
+    MOBILE_EXTRA = []
+
+if cm.is_mobile():
+    extra = st.session_state.get("mobile_extra")
+    if extra in MOBILE_EXTRA:
+        if st.button("← 返回", key="mobile_back"):
+            st.session_state.pop("mobile_extra", None)
+            st.rerun()
+        st.divider()
+        PAGES[extra]()
+    else:
+        labels = list(MOBILE_TABS)
+        with st.container(key="bottomnav"):
+            tab = st.segmented_control(
+                "导航", labels, default=labels[0], key="mobile_tab",
+                label_visibility="collapsed",
+            )
+        target = MOBILE_TABS.get(tab or labels[0], labels[0])
+        if target == "我的":
+            page_me()
+        elif target == "成绩":
+            page_exams()
+        elif target == "我的成绩":
+            um.page_student_scores()
+        else:
+            PAGES[target]()
 else:
     page = st.sidebar.radio("导航", list(PAGES), key="page")
-PAGES[page]()
+    PAGES[page]()
