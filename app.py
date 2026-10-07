@@ -1174,13 +1174,13 @@ if cm.is_mobile():
         st.divider()
         PAGES[extra]()
     else:
-        labels = list(MOBILE_TABS)
+        tab_labels = list(MOBILE_TABS)
         with st.container(key="bottomnav"):
             tab = st.segmented_control(
-                "导航", labels, default=labels[0], key="mobile_tab",
+                "导航", tab_labels, default=tab_labels[0], key="mobile_tab",
                 label_visibility="collapsed",
             )
-        target = MOBILE_TABS.get(tab or labels[0], labels[0])
+        target = MOBILE_TABS.get(tab or tab_labels[0], tab_labels[0])
         if target == "我的":
             page_me()
         elif target == "成绩":

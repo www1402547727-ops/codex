@@ -6,6 +6,7 @@ import os
 import sqlite3
 import tempfile
 import threading
+import time
 from datetime import date
 from pathlib import Path
 from urllib.parse import quote
@@ -24,6 +25,7 @@ _prepared = False
 _remote_db_missing = False
 _last_backup_date = ""
 _last_uploaded_digest = ""
+_UPLOAD_RETRIES = 3   # 上传遇到网络抖动/5xx 时的重试次数
 
 
 class CloudStorageError(RuntimeError):
@@ -108,18 +110,28 @@ def download_object(object_path: str) -> bytes | None:
 
 
 def upload_object(object_path: str, data: bytes, content_type: str | None = None) -> None:
+    """上传到云端。遇到超时/连接错误/5xx/429 会自动重试,避免一次瞬时抖动就让保存失败甚至应用起不来。"""
     if not is_cloud():
         return
     mime = content_type or mimetypes.guess_type(str(object_path))[0] or "application/octet-stream"
-    response = requests.post(
-        _object_url(object_path),
-        headers=_headers(mime),
-        data=data,
-        timeout=(15, 180),
-    )
-    if not response.ok:
-        detail = response.text[:300]
-        raise CloudStorageError(f"上传云端文件失败：HTTP {response.status_code} {detail}")
+    url = _object_url(object_path)
+    headers = _headers(mime)
+    last_error = "未知错误"
+    for attempt in range(_UPLOAD_RETRIES):
+        try:
+            response = requests.post(url, headers=headers, data=data, timeout=(15, 180))
+        except requests.RequestException as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+        else:
+            if response.ok:
+                return
+            last_error = f"HTTP {response.status_code} {response.text[:200]}"
+            # 4xx(除 429)是请求本身有问题,重试无意义
+            if response.status_code < 500 and response.status_code != 429:
+                break
+        if attempt < _UPLOAD_RETRIES - 1:
+            time.sleep(1.5 * (attempt + 1))
+    raise CloudStorageError(f"上传云端文件失败：{last_error}")
 
 
 def upload_local_file(local_path: str | Path, object_path: str) -> None:
