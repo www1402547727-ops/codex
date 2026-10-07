@@ -170,6 +170,7 @@ CREATE TABLE IF NOT EXISTS lessons(id INTEGER PRIMARY KEY, class_id INTEGER, les
     homework TEXT DEFAULT '', note TEXT DEFAULT '', UNIQUE(class_id, lesson_date, start));
 CREATE TABLE IF NOT EXISTS exams(id INTEGER PRIMARY KEY, name TEXT NOT NULL, exam_date TEXT, subject TEXT,
     full_score REAL DEFAULT 100);
+CREATE TABLE IF NOT EXISTS exam_categories(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, sort INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS scores(id INTEGER PRIMARY KEY, student_id INTEGER, exam_id INTEGER, score REAL,
     wrong_qs TEXT DEFAULT '', reasons TEXT DEFAULT '', knowledge TEXT DEFAULT '', paper TEXT DEFAULT '',
     sheet TEXT DEFAULT '', note TEXT DEFAULT '');
@@ -186,7 +187,7 @@ CREATE VIEW v_lessons AS
 ADD_COLS = {
     "students": {"grade": "TEXT DEFAULT ''", "contact": "TEXT DEFAULT ''",
                  "status": "TEXT DEFAULT '在读'", "note": "TEXT DEFAULT ''"},
-    "exams": {"class_id": "INTEGER"},
+    "exams": {"class_id": "INTEGER", "category": "TEXT DEFAULT ''"},
     "classes": {"kind": "TEXT DEFAULT '班课'"},
     "lessons": {"plan_id": "INTEGER"},
 }
@@ -228,6 +229,10 @@ def init_db():
         for col, typ in cols.items():
             if col not in have:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+    # 考试分类：首次使用时给几个常用分类
+    if conn.execute("SELECT COUNT(*) FROM exam_categories").fetchone()[0] == 0:
+        for i, nm in enumerate(["月考", "期中", "期末", "模拟考", "随堂测", "其他"]):
+            conn.execute("INSERT OR IGNORE INTO exam_categories(name, sort) VALUES(?,?)", (nm, i))
     # 一次性迁移:旧版学生表里的"班级"文字 -> 班级表 + 班级名单
     if conn.execute("PRAGMA user_version").fetchone()[0] < 1:
         conn.execute("INSERT OR IGNORE INTO classes(name) SELECT DISTINCT class_name FROM students WHERE class_name!=''")
@@ -929,9 +934,22 @@ def pick_exam(key):
     if ex.empty:
         st.info("先在「考试管理」里添加考试")
         return None
-    lab = labels(ex, lambda r: f"{r['exam_date']} {r['name']} {r['cname']}({r['subject']})")
+    subs = sorted({str(x) for x in ex["subject"].fillna("") if str(x).strip()})
+    cats = sorted({str(x) for x in ex["category"].fillna("") if str(x).strip()})
+    f1, f2 = st.columns(2)
+    sub = f1.selectbox("科目", ["全部"] + subs, key=f"{key}_subj")
+    cat = f2.selectbox("分类", ["全部"] + cats, key=f"{key}_cat")
+    view = ex
+    if sub != "全部":
+        view = view[view["subject"].fillna("") == sub]
+    if cat != "全部":
+        view = view[view["category"].fillna("") == cat]
+    if view.empty:
+        st.info("这个筛选条件下没有考试，换个科目或分类试试。")
+        return None
+    lab = labels(view, lambda r: f"{r['exam_date']} {r['name']} {r['cname']}({r['subject']})")
     eid = st.selectbox("考试", list(lab), format_func=lab.get, key=key)
-    return ex[ex.id == eid].iloc[0]
+    return view[view.id == eid].iloc[0]
 
 
 def exam_students(ex):
@@ -1030,21 +1048,127 @@ def tab_student():
 
 def tab_manage():
     cls = query("SELECT id, name FROM classes ORDER BY name")
+    cls_map = dict(zip(cls.id, cls.name)) if not cls.empty else {}
+    cls_ids = cls.id.tolist() if not cls.empty else []
+
+    msg = st.session_state.pop("exam_msg", None)
+    if msg:
+        st.success(msg)
+
+    cat_names = query("SELECT name FROM exam_categories ORDER BY sort, id")["name"].tolist()
+
+    # ---------- 分类管理 ----------
+    with st.expander("🏷 考试分类（期中 / 期末 / 月考 … 可以自己加）"):
+        c1, c2 = st.columns([3, 1])
+        new_cat = c1.text_input("新增分类", placeholder="例如：单元测", key="new_cat_name", label_visibility="collapsed")
+        if c2.button("添加分类", key="add_cat_btn"):
+            nm = (new_cat or "").strip()
+            if not nm:
+                st.warning("先填分类名称")
+            elif nm in cat_names:
+                st.warning("这个分类已经存在")
+            else:
+                nxt = int(query("SELECT COALESCE(MAX(sort),0)+1 n FROM exam_categories").n[0])
+                run("INSERT INTO exam_categories(name, sort) VALUES(?,?)", (nm, nxt))
+                st.rerun()
+        if cat_names:
+            st.caption("现在有：" + "、".join(cat_names))
+            d1, d2 = st.columns([3, 1])
+            del_cat = d1.selectbox("要删除的分类", cat_names, key="del_cat_name", label_visibility="collapsed")
+            if d2.button("删除分类", key="del_cat_btn"):
+                used = int(query("SELECT COUNT(*) n FROM exams WHERE COALESCE(category,'')=?", (del_cat,)).n[0])
+                if used:
+                    st.error(f"还有 {used} 场考试属于「{del_cat}」，请先把它们改成别的分类")
+                else:
+                    run("DELETE FROM exam_categories WHERE name=?", (del_cat,))
+                    st.rerun()
+
+    # ---------- 新增考试 ----------
     with st.form("new_exam"):
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3 = st.columns(3)
         n = c1.text_input("考试名称")
         d = c2.date_input("日期", date.today())
         s = c3.selectbox("科目", SUBJECTS)
-        f = c4.number_input("满分", 1.0, 300.0, 100.0, 5.0)
-        c = st.selectbox("所属班级(选了才能统计班级排名和「待录成绩」)", [0] + cls.id.tolist(),
-                         format_func=lambda i: "不限班级" if i == 0 else dict(zip(cls.id, cls.name))[i])
-        if st.form_submit_button("添加考试") and n.strip():
-            run("INSERT INTO exams(name, exam_date, subject, full_score, class_id) VALUES(?,?,?,?,?)",
-                (n.strip(), str(d), s, f, c or None))
+        c4, c5 = st.columns(2)
+        cat = c4.selectbox("分类", [""] + cat_names, format_func=lambda x: x or "未分类")
+        f = c5.number_input("满分", 1.0, 300.0, 100.0, 5.0)
+        c = st.selectbox("所属班级(选了才能统计班级排名和「待录成绩」)", [0] + cls_ids,
+                         format_func=lambda i: "不限班级" if i == 0 else cls_map.get(i, str(i)))
+        if st.form_submit_button("添加考试", type="primary") and n.strip():
+            run("""INSERT INTO exams(name, exam_date, subject, full_score, class_id, category)
+                   VALUES(?,?,?,?,?,?)""", (n.strip(), str(d), s, f, c or None, cat))
+            st.session_state["exam_msg"] = f"已添加考试「{n.strip()}」"
             st.rerun()
-    st.dataframe(query("""SELECT e.exam_date 日期, e.name 考试, e.subject 科目, e.full_score 满分, COALESCE(c.name,'不限') 班级
-                          FROM exams e LEFT JOIN classes c ON c.id=e.class_id ORDER BY e.exam_date DESC"""),
-                 hide_index=True, use_container_width=True)
+
+    # ---------- 列表 + 筛选 ----------
+    all_ex = query("""SELECT e.id, e.exam_date, e.name, e.subject, COALESCE(e.category,'') category,
+                             e.full_score, COALESCE(c.name,'不限') cname
+                      FROM exams e LEFT JOIN classes c ON c.id=e.class_id
+                      ORDER BY e.exam_date DESC, e.id DESC""")
+    if all_ex.empty:
+        st.info("还没有考试记录，先在上面添加。")
+        return
+    f1, f2 = st.columns(2)
+    subs = ["全部"] + sorted({str(x) for x in all_ex["subject"].fillna("") if str(x).strip()})
+    catf = ["全部"] + sorted({str(x) for x in all_ex["category"].fillna("") if str(x).strip()})
+    sub_f = f1.selectbox("按科目看", subs, key="mng_sub")
+    cat_f = f2.selectbox("按分类看", catf, key="mng_cat")
+    view = all_ex
+    if sub_f != "全部":
+        view = view[view["subject"].fillna("") == sub_f]
+    if cat_f != "全部":
+        view = view[view["category"].fillna("") == cat_f]
+    show = view.copy()
+    show["分类"] = show["category"].replace("", "未分类")
+    st.dataframe(
+        show[["exam_date", "name", "subject", "分类", "full_score", "cname"]].rename(
+            columns={"exam_date": "日期", "name": "考试", "subject": "科目", "full_score": "满分", "cname": "班级"}),
+        hide_index=True, use_container_width=True,
+    )
+    if view.empty:
+        st.info("这个筛选条件下没有考试，换个科目或分类试试。")
+        return
+
+    # ---------- 修改 / 删除 ----------
+    st.subheader("修改或删除考试")
+    lab = labels(view, lambda r: f"{r['exam_date']} {r['name']} ({r['subject']} · {r['category'] or '未分类'})")
+    pick = st.selectbox("选择考试", list(lab), format_func=lab.get, key="edit_exam_pick")
+    ex = query("SELECT * FROM exams WHERE id=?", (int(pick),)).iloc[0]
+    try:
+        cur_date = pd.to_datetime(ex["exam_date"]).date()
+    except Exception:
+        cur_date = date.today()
+    cls_opts = [0] + cls_ids
+    cur_cls = int(ex["class_id"]) if pd.notna(ex["class_id"]) else 0
+    cur_subj = str(ex["subject"] or "")
+    subj_opts = SUBJECTS if cur_subj in SUBJECTS else SUBJECTS + [cur_subj]
+    with st.form(f"edit_exam_{pick}"):
+        c1, c2, c3 = st.columns(3)
+        n2 = c1.text_input("考试名称", str(ex["name"]))
+        d2 = c2.date_input("日期", cur_date)
+        s2 = c3.selectbox("科目", subj_opts, index=subj_opts.index(cur_subj))
+        c4, c5 = st.columns(2)
+        cat_opts = [""] + cat_names
+        cur_cat = str(ex["category"] or "")
+        cat2 = c4.selectbox("分类", cat_opts, index=cat_opts.index(cur_cat) if cur_cat in cat_opts else 0,
+                            format_func=lambda x: x or "未分类")
+        f2v = c5.number_input("满分", 1.0, 300.0, float(ex["full_score"] or 100), 5.0)
+        c2v = st.selectbox("所属班级", cls_opts, index=cls_opts.index(cur_cls) if cur_cls in cls_opts else 0,
+                           format_func=lambda i: "不限班级" if i == 0 else cls_map.get(i, str(i)))
+        b1, b2 = st.columns(2)
+        if b1.form_submit_button("💾 保存修改", type="primary"):
+            run("""UPDATE exams SET name=?, exam_date=?, subject=?, full_score=?, class_id=?, category=?
+                   WHERE id=?""", (n2.strip(), str(d2), s2, f2v, c2v or None, cat2, int(pick)))
+            st.session_state["exam_msg"] = f"考试「{n2.strip()}」已保存"
+            st.rerun()
+        if b2.form_submit_button("🗑 删除这场考试"):
+            cnt = int(query("SELECT COUNT(*) n FROM scores WHERE exam_id=?", (int(pick),)).n[0])
+            if cnt:
+                st.error(f"这场考试已经有 {cnt} 条成绩，请先清掉成绩再删考试")
+            else:
+                run("DELETE FROM exams WHERE id=?", (int(pick),))
+                st.session_state["exam_msg"] = f"考试「{ex['name']}」已删除"
+                st.rerun()
 
 
 def page_exams():
