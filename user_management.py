@@ -432,6 +432,20 @@ def _create_student_account(student_id: int, username: str, password: str) -> tu
     return True, ""
 
 
+def _delete_student_account(user_id: int, actor: str) -> str:
+    """删除学生登录账号（只删账号，学生资料/课程/成绩/课时都保留）。返回被删账号名，失败返回空串。"""
+    row = query("SELECT username, role FROM users WHERE id=?", (int(user_id),))
+    if row.empty:
+        return ""
+    if str(row["role"].iloc[0]) == ROLE_TEACHER:
+        return ""  # 老师账号不允许删
+    username = str(row["username"].iloc[0])
+    run("DELETE FROM users WHERE id=?", (int(user_id),))
+    run("DELETE FROM user_login_attempts WHERE username=?", (username,))
+    _audit(str(actor), "student_account_deleted", f"username={username}")
+    return username
+
+
 def page_user_admin() -> None:
     user = _require_teacher()
     st.title("账号管理")
@@ -444,6 +458,9 @@ def page_user_admin() -> None:
         st.warning("请把初始密码发给学生，学生首次登录后必须修改密码。")
     if reset:
         st.success(f"账号 {reset['username']} 的新密码：{reset['password']}")
+    deleted = st.session_state.pop("account_deleted", None)
+    if deleted:
+        st.success(f"账号「{deleted}」已删除。该学生的资料、课程、成绩和课时都还在。")
 
     students = query(
         """SELECT s.id, s.name, s.grade, s.status
@@ -536,6 +553,25 @@ def page_user_admin() -> None:
             f"user_id={int(selected)}",
         )
         st.rerun()
+
+    st.divider()
+    if st.session_state.get("confirm_del_user") == int(selected):
+        st.error(f"确认要删除账号「{row['username']}」吗？删除后这个学生就登不进来了（不可撤销）。")
+        d1, d2 = st.columns(2)
+        if d1.button("✓ 确认删除", type="primary", use_container_width=True, key="del_user_yes"):
+            removed = _delete_student_account(int(selected), str(user["username"]))
+            st.session_state.pop("confirm_del_user", None)
+            if removed:
+                st.session_state["account_deleted"] = removed
+            st.rerun()
+        if d2.button("取消", use_container_width=True, key="del_user_no"):
+            st.session_state.pop("confirm_del_user", None)
+            st.rerun()
+    else:
+        st.caption("删除账号只会让学生无法登录；他的资料、课程、成绩、课时都会保留。以后想恢复，重新创建一个账号即可。")
+        if st.button("🗑 删除这个账号", use_container_width=True, key="del_user_ask"):
+            st.session_state["confirm_del_user"] = int(selected)
+            st.rerun()
 
 STATUS_ICON = {
     "待上课": "🔵",
