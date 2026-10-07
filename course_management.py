@@ -914,64 +914,8 @@ def _class_month_detail(class_id: int, month: str) -> pd.DataFrame:
 
 
 def _inject_css() -> None:
-    st.markdown(
-        """
-        <style>
-        .block-container {padding-top: 1.4rem; max-width: 1500px;}
-        div[data-testid="stVerticalBlockBorderWrapper"] {border-radius: 14px !important; border-color: #E3E8F1 !important;}
-        .course-meta {color:#667085;font-size:.86rem;line-height:1.35;}
-        .course-done {background:#F0F4FA;border-left:4px solid #6F83B8!important;}
-        .course-pending {background:#FFFFFF;border-left:4px solid #3B6EF5!important;}
-        .course-cancelled {background:#F7F7F8;border-left:4px solid #9AA4B2!important;opacity:.78;}
-        table.wk2 {width:100%;border-collapse:separate;border-spacing:2px;table-layout:fixed;font-size:11px;}
-        table.wk2 th {padding:7px 3px;background:#EEF3FA;border-radius:7px;text-align:center;}
-        table.wk2 th.today {background:#3B6EF5;color:#fff;}
-        table.wk2 td {height:20px;padding:1px 3px;vertical-align:top;border-radius:5px;overflow:hidden;white-space:nowrap;}
-        table.wk2 td.tm {width:48px;text-align:right;color:#98A2B3;background:transparent;padding-right:6px;}
-        table.wk2 td.free {background:#F5F8FC;}
-        table.wk2 td.busy {background:#DCE8FF;color:#174EA6;font-weight:650;}
-        table.wk2 td.done {background:#D9E2F2;color:#42526E;font-weight:650;}
-        table.month2 {width:100%;border-collapse:separate;border-spacing:4px;table-layout:fixed;font-size:11px;}
-        table.month2 th {padding:7px 2px;background:#EEF3FA;border-radius:7px;text-align:center;}
-        table.month2 td {height:104px;padding:6px;vertical-align:top;background:#F7F9FC;border-radius:9px;overflow:hidden;}
-        table.month2 td.today {outline:2px solid #3B6EF5;background:#F2F6FF;}
-        table.month2 td.outside {background:transparent;color:#C4CAD3;}
-        table.month2 .daynum {font-weight:750;margin-bottom:3px;}
-        table.month2 .mini {display:block;color:#334155;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-        .tiny-note {color:#98A2B3;font-size:.78rem;}
-        @media (max-width: 760px) {
-            .block-container {padding: 0.5rem 0.7rem 6.5rem !important;}
-            [data-testid="stMainBlockContainer"] {padding-top: 0.4rem !important;}
-            h1 {font-size: 1.5rem !important; line-height: 1.25 !important;}
-            h2 {font-size: 1.2rem !important;}
-            h3, h4 {font-size: 1.02rem !important;}
-            .stButton > button {min-height: 2.7rem; font-size: .95rem;}
-            [data-testid="stMetric"] {padding: 8px 10px;}
-            [data-testid="stMetricValue"] {font-size: 1.3rem;}
-            div[data-testid="stHorizontalBlock"] {gap: .45rem !important;}
-            .mday {font-weight: 700; font-size: 1rem; margin: 14px 0 6px; padding: 7px 10px;
-                   border-radius: 9px; background: #EEF3FA; color: #344054;}
-            .mday.today {background: #3B6EF5; color: #fff;}
-            .mempty {color: #98A2B3; font-size: .85rem; margin: 0 0 6px 10px;}
-            .mstats {display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 6px 0 10px;}
-            .mstat {background: #FFF; border: 1px solid #E1E6EE; border-radius: 11px; padding: 9px 11px;}
-            .mstat span {display: block; color: #667085; font-size: .8rem;}
-            .mstat b {font-size: 1.28rem; line-height: 1.2;}
-            table.wk2.m {font-size: 10px;}
-            table.wk2.m th {padding: 4px 1px; font-size: 10px; line-height: 1.15;}
-            table.wk2.m th .d {font-size: 9px; font-weight: 500; opacity: .85;}
-            table.wk2.m th .n {font-size: 9.5px; font-weight: 750;}
-            table.wk2.m td {height: 17px; padding: 0 1px; font-size: 10px;}
-            table.wk2.m td.tm {width: 46px; font-size: 9px;}
-            table.month2.m td {height: 46px; padding: 2px 3px; text-align: center;}
-            table.month2.m .daynum {margin-bottom: 1px; font-size: .8rem;}
-            table.month2.m .mnum {color: #3B6EF5; font-weight: 750; font-size: .72rem;}
-            table.month2.m .mdone {color: #7C93C9; font-size: .66rem;}
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+    """样式统一放在 ui_theme.py,由 app.py 启动时注入;这里留空函数,各页面的调用不用改。"""
+    return None
 
 
 def _set_dialog(course_id: int | None, default_date: date | None = None) -> None:
@@ -1115,67 +1059,63 @@ def _show_dialog_if_requested() -> None:
     if "course_dialog_id" in st.session_state:
         _course_dialog(st.session_state.get("course_dialog_id"))
 
-def _course_row(row, key: str, show_complete: bool = True) -> None:
-    """手机版：一节课程占一行，点整行打开编辑弹窗。"""
+def _course_state(status: str) -> str:
+    if status == STATUS_DONE:
+        return "done"
+    if status in (STATUS_LEAVE, STATUS_CANCEL, STATUS_MOVED):
+        return "off"
+    return "pending"
+
+
+def _chips_html(row, mobile: bool) -> str:
     status = str(row["status"])
-    pending = status == STATUS_PENDING
-    label = f"{row['start']}–{row['end']}　{row['target_name']} · {row['subject'] or '未填科目'}"
-    if show_complete and pending:
-        cols = st.columns([3.2, 1.8])
-        if cols[0].button(label, key=f"row_{key}_{row['id']}", use_container_width=True):
-            _set_dialog(int(row["id"]))
-        if cols[1].button("✓ 已上课", key=f"rowdone_{key}_{row['id']}", type="primary", use_container_width=True):
-            changed = complete_course(int(row["id"]))
+    chips = [
+        f"<span class='chip'>{_e(TYPE_LABELS.get(row['target_type'], row['target_type']))}</span>",
+        f"<span class='chip {_course_state(status)}'>{_e(status)}</span>",
+    ]
+    if row["location"]:
+        chips.append(f"<span class='chip'>📍 {_e(row['location'])}</span>")
+    if not mobile:
+        if row["target_type"] == TARGET_ONE:
+            chips.append(f"<span class='chip'>初始购买 {float(row['total_hours'] or 0):g} 课时</span>")
+        if status == STATUS_DONE and pd.notna(row["completed_at"]) and row["completed_at"]:
+            chips.append(f"<span class='chip'>完成于 {_e(str(row['completed_at'])[:16])}</span>")
+    if pd.notna(row["note"]) and row["note"]:
+        chips.append(f"<span class='chip'>备注：{_e(row['note'])}</span>")
+    return "<div class='chips'>" + "".join(chips) + "</div>"
+
+
+def _course_item(row, key: str, show_complete: bool = True) -> None:
+    """一节课 = 一张卡:左边色条是状态,第一行点一下编辑,待上课的右边有「✓ 已上课」。"""
+    status = str(row["status"])
+    rid = int(row["id"])
+    can_complete = show_complete and status == STATUS_PENDING
+    label = f"**{row['start']}** – {row['end']}　{row['target_name']} · {row['subject'] or '未填科目'}"
+    with st.container(key=f"card_{_course_state(status)}_{key}_{rid}"):
+        if can_complete:
+            left, right = st.columns([4.5, 1.5], vertical_alignment="center")
+        else:
+            left, right = st.container(), None
+        if left.button(label, key=f"open_{key}_{rid}", use_container_width=True):
+            _set_dialog(rid)
+        if right is not None and right.button(
+            "✓ 已上课", key=f"done_{key}_{rid}", type="primary", use_container_width=True
+        ):
+            changed = complete_course(rid)
             if changed and row["target_type"] == TARGET_ONE:
                 st.toast("已记录上课，自动扣除 1 课时")
             elif changed:
                 st.toast("已记录上课")
             st.rerun()
-    elif st.button(f"{label}　{STATUS_ICON.get(status, '')}", key=f"row_{key}_{row['id']}", use_container_width=True):
-        _set_dialog(int(row["id"]))
+        st.markdown(_chips_html(row, is_mobile()), unsafe_allow_html=True)
+
+
+def _course_row(row, key: str, show_complete: bool = True) -> None:
+    _course_item(row, key, show_complete)
 
 
 def _course_card(row, key: str, show_complete: bool = True) -> None:
-    status = str(row["status"])
-    css_class = (
-        "course-done" if status == STATUS_DONE
-        else "course-cancelled" if status in (STATUS_LEAVE, STATUS_CANCEL, STATUS_MOVED)
-        else "course-pending"
-    )
-    with st.container(border=True):
-        st.markdown(
-            f"<div class='{css_class}' style='padding:8px 10px;border-radius:8px;margin:-10px -10px 8px -10px'>",
-            unsafe_allow_html=True,
-        )
-        top = st.columns(1) if is_mobile() else st.columns([7, 2.2])
-        second = top[1] if len(top) > 1 else st
-        summary = f"{row['start']}–{row['end']}　{row['target_name']} · {row['subject'] or '未填科目'}"
-        if top[0].button(summary, key=f"edit_{key}_{row['id']}", use_container_width=True):
-            _set_dialog(int(row["id"]))
-        if show_complete and status == STATUS_PENDING:
-            if second.button("✓ 已上课", key=f"done_{key}_{row['id']}", type="primary", use_container_width=True):
-                changed = complete_course(int(row["id"]))
-                if changed and row["target_type"] == TARGET_ONE:
-                    st.toast("已记录上课，自动扣除 1 课时")
-                elif changed:
-                    st.toast("已记录上课")
-                st.rerun()
-        elif second.button("编辑", key=f"editbtn_{key}_{row['id']}", use_container_width=True):
-            _set_dialog(int(row["id"]))
-        meta = [
-            TYPE_LABELS.get(row["target_type"], row["target_type"]),
-            STATUS_ICON.get(status, "") + status,
-        ]
-        if row["location"]:
-            meta.append(f"📍 {row['location']}")
-        if row["target_type"] == TARGET_ONE:
-            meta.append(f"初始购买课时 {float(row['total_hours'] or 0):g}")
-        if status == STATUS_DONE and row["completed_at"]:
-            meta.append(f"完成于 {str(row['completed_at'])[:16]}")
-        if row["note"]:
-            meta.append(f"备注：{row['note']}")
-        st.markdown(f"<div class='course-meta'>{_e('　·　'.join(meta))}</div>", unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
+    _course_item(row, key, show_complete)
 
 
 def _render_day_cards(day: date, key: str, show_empty: bool = True) -> None:
@@ -1190,6 +1130,7 @@ def _render_day_cards(day: date, key: str, show_empty: bool = True) -> None:
 
 def _week_grid_html(ws: date, mobile: bool = False) -> str:
     days = [ws + timedelta(i) for i in range(7)]
+    today_idx = (date.today() - ws).days
     courses = _courses_between(ws, days[-1])
     courses = courses[courses["status"].isin(ACTIVE_STATUSES)]
     cells: dict[tuple[int, int], tuple[str, str]] = {}
@@ -1241,7 +1182,8 @@ def _week_grid_html(ws: date, mobile: bool = False) -> str:
         out.append(f"<tr><td class='tm'>{_hm(slot) if slot % 60 == 0 else ''}</td>")
         for i in range(7):
             cell = cells.get((i, slot))
-            out.append(f"<td class='{cell[0]}'>{cell[1]}</td>" if cell else "<td class='free'></td>")
+            tdy = " tdy" if i == today_idx else ""
+            out.append(f"<td class='{cell[0]}{tdy}'>{cell[1]}</td>" if cell else f"<td class='free{tdy}'></td>")
         out.append("</tr>")
     out.append("</table>")
     return "".join(out)
@@ -1285,10 +1227,8 @@ def _render_week(ws: date) -> None:
         for idx, day in enumerate(days):
             with columns[idx]:
                 st.markdown(
-                    f"<div style='text-align:center;padding:6px;border-radius:8px;"
-                    f"background:{'#3B6EF5' if day == date.today() else '#EEF3FA'};"
-                    f"color:{'white' if day == date.today() else '#344054'};font-weight:700'>"
-                    f"{WD[idx]}<br><span style='font-size:.84rem'>{day.month}/{day.day}</span></div>",
+                    f"<div class='dayhead{' today' if day == date.today() else ''}'>{WD[idx]}"
+                    f"<small>{day.month}/{day.day}</small></div>",
                     unsafe_allow_html=True,
                 )
                 df = _courses_between(day, day)
@@ -1331,9 +1271,10 @@ def _month_grid_html(day_in_month: date, mobile: bool = False) -> str:
                             out.append(f"<div class='mdone'>{done}✓</div>")
                 else:
                     for row in items[:4]:
-                        mark = "✓" if row["status"] == STATUS_DONE else row["start"]
+                        is_done = row["status"] == STATUS_DONE
+                        mark = "✓" if is_done else row["start"]
                         out.append(
-                            f"<span class='mini'>{_e(mark)} {_e(row['target_name'])} {_e(row['subject'] or '')}</span>"
+                            f"<span class='mini{' done' if is_done else ''}'>{_e(mark)} {_e(row['target_name'])} {_e(row['subject'] or '')}</span>"
                         )
                     if len(items) > 4:
                         out.append(f"<span class='tiny-note'>另有 {len(items)-4} 节</span>")

@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import os
 import secrets
+import html
 import sqlite3
 import string
 import time
@@ -317,13 +318,14 @@ def render_login() -> None:
     st.markdown(
         """
         <style>
-        .block-container {max-width: 520px; padding-top: 8vh;}
-        div[data-testid="stForm"] {border:1px solid #E3E8F1;border-radius:16px;padding:24px;background:#fff;}
+        .block-container {max-width: 460px; padding-top: 9vh;}
+        div[data-testid="stForm"] {border:1px solid #DDE3DF;border-radius:16px;padding:24px;background:#fff;}
         </style>
+        <div class="login-title">教务工作台</div>
+        <div class="login-sub">请登录老师或学生账号</div>
         """,
         unsafe_allow_html=True,
     )
-    st.title("教务工作台")
     with st.form("login_form"):
         username = st.text_input("账号", placeholder="老师账号或学生账号")
         password = st.text_input("密码", type="password")
@@ -609,17 +611,21 @@ def _student_courses(student_id: int) -> pd.DataFrame:
 
 def _render_student_course_card(row) -> None:
     status = str(row["status"])
-    with st.container(border=True):
-        c1, c2 = st.columns([3, 5])
-        c1.markdown(f"### {row['start']}–{row['end']}")
-        c1.caption(str(row["plan_date"]))
-        tag = "一对一" if row["target_type"] == "一对一" else "班级课"
-        c2.markdown(f"**{row['target_name']}**")
-        c2.write(f"{tag} · {row['subject'] or '未填写科目'}")
-        if row["location"]:
-            c2.caption(f"📍 {row['location']}")
-        c2.caption(f"{STATUS_ICON.get(status, '')} {status}")
-
+    state = "done" if status == "已上课" else "off" if status in ("请假", "取消", "调课") else "pending"
+    tag = "一对一" if row["target_type"] == "一对一" else "班级课"
+    chips = [f"<span class='chip'>{html.escape(tag)}</span>", f"<span class='chip {state}'>{html.escape(status)}</span>"]
+    if row["subject"]:
+        chips.append(f"<span class='chip'>{html.escape(str(row['subject']))}</span>")
+    if row["location"]:
+        chips.append(f"<span class='chip'>📍 {html.escape(str(row['location']))}</span>")
+    with st.container(key=f"card_{state}_stu_{int(row['id'])}"):
+        st.markdown(
+            f"<div class='srow'><div class='stime'><b>{html.escape(str(row['start']))}</b>"
+            f"<span>{html.escape(str(row['end']))}</span></div>"
+            f"<div><div class='sname'>{html.escape(str(row['target_name']))}</div>"
+            f"<div class='chips'>{''.join(chips)}</div></div></div>",
+            unsafe_allow_html=True,
+        )
 
 def page_student_courses() -> None:
     user = current_user()
@@ -647,9 +653,12 @@ def page_student_courses() -> None:
         return
     if scope == "历史课程":
         df = df.sort_values(["plan_date", "start"], ascending=False)
+    last_day = None
     for _, row in df.iterrows():
+        if row["plan_date"] != last_day:
+            last_day = row["plan_date"]
+            st.markdown(f"<div class='sdate'>{html.escape(str(last_day))}</div>", unsafe_allow_html=True)
         _render_student_course_card(row)
-
 
 def page_student_scores() -> None:
     user = current_user()

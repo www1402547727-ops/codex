@@ -12,6 +12,7 @@ from PIL import Image, ImageOps
 
 import cloud_store
 import course_management as cm
+import ui_theme
 import user_management as um
 
 # ==================== 配置 ====================
@@ -36,42 +37,7 @@ except Exception as exc:
 if cloud_store.is_cloud() and not database_found:
     st.error("云端数据库尚未初始化。请先把本地 data/scores.db 上传到 Supabase Storage 的 database/scores.db。")
     st.stop()
-st.markdown("""
-<style>
-#MainMenu, footer {visibility: hidden;}
-.st-key-bottomnav {position: fixed; left: 0; right: 0; bottom: 0; z-index: 1000;
-  background: #FFFFFF; border-top: 1px solid #E1E6EE;
-  padding: 6px 8px calc(8px + env(safe-area-inset-bottom));}
-[class*="st-key-me_quick"] [data-testid="stHorizontalBlock"],
-[class*="st-key-me_month"] [data-testid="stHorizontalBlock"] {flex-wrap: nowrap !important; width: 100% !important;}
-[class*="st-key-me_quick"] [data-testid="stColumn"],
-[class*="st-key-me_month"] [data-testid="stColumn"] {min-width: 0 !important; flex: 1 1 0 !important; width: auto !important;}
-[class*="st-key-me_quick"] .stElementContainer,
-[class*="st-key-me_month"] .stElementContainer,
-[class*="st-key-me_quick"] button,
-[class*="st-key-me_month"] button {width: 100% !important; min-width: 0 !important;}
-.st-key-bottomnav .stElementContainer,
-.st-key-bottomnav [data-testid="stButtonGroup"],
-.st-key-bottomnav [role="radiogroup"] {width: 100% !important;}
-.st-key-bottomnav [role="radiogroup"] {display: flex !important; gap: 4px !important;}
-.st-key-bottomnav button {flex: 1 1 0 !important; min-width: 0 !important;
-  font-size: .8rem !important; padding: 7px 2px !important; justify-content: center !important;}
-.block-container {padding-top: 2rem; max-width: 1100px;}
-.stButton > button {border-radius: 10px; font-weight: 600; border: 1px solid #D5DCE8;}
-[data-testid="stExpander"] {border-radius: 12px; border: 1px solid #E1E6EE; background: #FFF;}
-[data-testid="stMetric"] {background:#FFF; border:1px solid #E1E6EE; border-radius:12px; padding:12px 16px;}
-[data-testid="stImage"] img {border-radius: 10px; border: 1px solid #E1E6EE;}
-table.wk {width:100%; border-collapse:collapse; table-layout:fixed; font-size:12px;}
-table.wk th {padding:6px 2px; background:#EAEFF7; font-weight:600;}
-table.wk th.today {background:#3B6EF5; color:#fff;}
-table.wk td {height:19px; padding:0 4px; border:1px solid #fff; overflow:hidden; white-space:nowrap;}
-table.wk td.tm {width:46px; text-align:right; color:#8A94A6; border:none; background:none;}
-table.wk td.free {background:#E4F5EC;}
-table.wk td.busy {background:#3B6EF5; color:#fff; font-weight:600;}
-table.wk td.done {background:#7C93C9; color:#fff; font-weight:600;}
-@media (max-width: 640px) {.stButton > button {width:100%;}}
-</style>
-""", unsafe_allow_html=True)
+ui_theme.inject()
 
 
 # 把「添加到主屏幕」需要的 meta / manifest 注入到页面 <head>（iPhone、安卓通用）
@@ -101,7 +67,7 @@ _PWA_SCRIPT = """
   meta("apple-mobile-web-app-status-bar-style", "default");
   meta("apple-mobile-web-app-title", "\u6559\u52a1\u5de5\u4f5c\u53f0");
   meta("application-name", "\u6559\u52a1\u5de5\u4f5c\u53f0");
-  meta("theme-color", "#3B6EF5");
+  meta("theme-color", "#1F5C4D");
   function link(rel, href, sizes) {
     var old = head.querySelector('link[rel="' + rel + '"]');
     if (old) { old.setAttribute("href", href); return; }
