@@ -192,6 +192,34 @@ ADD_COLS = {
 }
 
 
+def _merge_duplicate_students(conn) -> list:
+    """把"同一个人被建成多条记录"合并成一条：搬运班级/成绩/账号/一对一关联到保留的那条。"""
+    groups = conn.execute(
+        """SELECT TRIM(name) nm, GROUP_CONCAT(id) ids FROM students
+           GROUP BY TRIM(name) HAVING COUNT(*) > 1"""
+    ).fetchall()
+    merged = []
+    for nm, ids_text in groups:
+        ids = sorted(int(x) for x in str(ids_text).split(","))
+        keep = ids[0]
+        # 优先保留已被"账号"或"一对一"引用的那条，避免断链
+        for cand in ids:
+            if conn.execute("SELECT 1 FROM users WHERE student_id=?", (cand,)).fetchone() \
+               or conn.execute("SELECT 1 FROM one_to_one_students WHERE student_id=?", (cand,)).fetchone():
+                keep = cand
+                break
+        drop = [i for i in ids if i != keep]
+        for d in drop:
+            conn.execute("UPDATE OR IGNORE class_members SET student_id=? WHERE student_id=?", (keep, d))
+            conn.execute("DELETE FROM class_members WHERE student_id=?", (d,))
+            conn.execute("UPDATE scores SET student_id=? WHERE student_id=?", (keep, d))
+            conn.execute("UPDATE users SET student_id=? WHERE student_id=?", (keep, d))
+            conn.execute("UPDATE one_to_one_students SET student_id=? WHERE student_id=?", (keep, d))
+            conn.execute("DELETE FROM students WHERE id=?", (d,))
+        merged.append((nm, keep, drop))
+    return merged
+
+
 def init_db():
     conn = sqlite3.connect(DB)
     conn.executescript(SCHEMA)
@@ -221,6 +249,14 @@ def init_db():
         conn.execute("UPDATE lessons SET plan_id=(SELECT p.id FROM plans p WHERE p.class_id=lessons.class_id AND p.plan_date=lessons.lesson_date AND p.start=lessons.start)")
         conn.execute("UPDATE lessons SET hours = 1")
         conn.execute("PRAGMA user_version = 2")
+    # 一次性修复：同一个人被建成了多条学生记录 -> 合并（只跑一次）
+    conn.execute("""CREATE TABLE IF NOT EXISTS app_migrations(
+                        name TEXT PRIMARY KEY, applied_at TEXT DEFAULT '', detail TEXT DEFAULT '')""")
+    if not conn.execute("SELECT 1 FROM app_migrations WHERE name='merge_dup_students_v1'").fetchone():
+        merged = _merge_duplicate_students(conn)
+        detail = "; ".join(f"{nm}: 保留#{keep} 合并{drop}" for nm, keep, drop in merged)
+        conn.execute("INSERT INTO app_migrations(name, applied_at, detail) VALUES(?,?,?)",
+                     ("merge_dup_students_v1", datetime.now().isoformat(timespec="seconds"), detail))
     conn.commit()
     conn.close()
     cloud_store.save_database(DB)
@@ -761,11 +797,43 @@ def page_students():
             join = st.multiselect("加入班级", cls.id.tolist(), format_func=dict(zip(cls.id, cls.name)).get)
             if st.form_submit_button("添加"):
                 lst = [x.strip() for x in names.splitlines() if x.strip()]
+                added, reused = 0, 0
                 for n in lst:
-                    sid = run("INSERT INTO students(name, grade, contact) VALUES(?,?,?)", (n, grade, contact))
+                    hit = query("SELECT id FROM students WHERE TRIM(name)=? ORDER BY id LIMIT 1", (n,))
+                    if len(hit):
+                        sid = int(hit["id"].iloc[0])
+                        reused += 1
+                    else:
+                        sid = run("INSERT INTO students(name, grade, contact) VALUES(?,?,?)", (n, grade, contact))
+                        added += 1
                     for c in join:
                         run("INSERT OR IGNORE INTO class_members VALUES(?,?)", (int(c), sid))
-                st.success(f"添加了 {len(lst)} 人")
+                msg = f"新增 {added} 人"
+                if reused:
+                    msg += f"；{reused} 人本来就有，直接复用并加入所选班级(不会重复建人)"
+                st.success(msg)
+    with st.expander("🔗 把已有学生加入 / 移出班级"):
+        if cls.empty:
+            st.info("先去「教学对象 → 班级」建一个班级")
+        else:
+            all_stu = query("SELECT id, name FROM students ORDER BY name")
+            cid2 = st.selectbox("选择班级", cls.id.tolist(),
+                                format_func=dict(zip(cls.id, cls.name)).get, key="roster_class")
+            now_members = query("SELECT student_id FROM class_members WHERE class_id=?",
+                                (int(cid2),)).student_id.tolist()
+            valid_ids = set(all_stu.id.tolist())
+            picked = st.multiselect(
+                "这个班里有哪些学生", all_stu.id.tolist(),
+                default=[x for x in now_members if x in valid_ids],
+                format_func=dict(zip(all_stu.id, all_stu.name)).get,
+                key=f"roster_members_{cid2}",
+            )
+            if st.button("保存班级名单", type="primary", key=f"roster_save_{cid2}"):
+                run("DELETE FROM class_members WHERE class_id=?", (int(cid2),))
+                for sid in picked:
+                    run("INSERT OR IGNORE INTO class_members VALUES(?,?)", (int(cid2), int(sid)))
+                st.success("名单已保存")
+                st.rerun()
     flt = st.radio("状态", ["在读", "停课", "全部"], horizontal=True)
     df = query("""SELECT s.id, s.name 姓名, s.grade 年级, s.status 状态, s.contact 联系方式,
                   (SELECT GROUP_CONCAT(c.name, '、') FROM class_members m JOIN classes c ON c.id=m.class_id
