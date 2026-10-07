@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import mimetypes
 import os
+import sqlite3
 import tempfile
 import threading
 from datetime import date
@@ -21,6 +23,7 @@ _config: dict[str, str] | None = None
 _prepared = False
 _remote_db_missing = False
 _last_backup_date = ""
+_last_uploaded_digest = ""
 
 
 class CloudStorageError(RuntimeError):
@@ -160,20 +163,47 @@ def prepare_database(db_path: str | Path) -> bool:
         return True
 
 
+def _snapshot(path: Path) -> bytes:
+    """用 SQLite 自带的在线备份接口拿一份一致的快照。
+    直接 read_bytes() 读正在被别的会话写入的 .db 文件,可能读到写了一半的内容。"""
+    snap = Path(tempfile.gettempdir()) / f"snap_{os.getpid()}_{threading.get_ident()}.db"
+    src = sqlite3.connect(path, timeout=15)
+    try:
+        dst = sqlite3.connect(snap)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+        return snap.read_bytes()
+    finally:
+        src.close()
+        snap.unlink(missing_ok=True)
+
+
 def save_database(db_path: str | Path) -> None:
-    global _last_backup_date
+    """把本地数据库同步到云端。内容没变就不上传(页面每次刷新都会调用到这里)。"""
+    global _last_backup_date, _last_uploaded_digest
     if not is_cloud():
         return
     path = Path(db_path)
     if not path.is_file():
         return
     with _lock:
-        data = path.read_bytes()
-        upload_object("database/scores.db", data, "application/vnd.sqlite3")
+        data = _snapshot(path)
+        digest = hashlib.sha256(data).hexdigest()
         today = date.today().isoformat()
         if today != _last_backup_date:
-            upload_object(f"backups/{today}/scores.db", data, "application/vnd.sqlite3")
-            _last_backup_date = today
+            # 当天的备份只在不存在时才写,避免应用重启后被「重启后的状态」覆盖。
+            # 备份属于锦上添花:这里任何网络抖动都不应该让"保存"本身失败,所以整段兜住异常。
+            try:
+                if download_object(f"backups/{today}/scores.db") is None:
+                    upload_object(f"backups/{today}/scores.db", data, "application/vnd.sqlite3")
+                _last_backup_date = today
+            except Exception:
+                pass  # 下次保存时再试
+        if digest != _last_uploaded_digest:
+            upload_object("database/scores.db", data, "application/vnd.sqlite3")
+            _last_uploaded_digest = digest
 
 
 def upload_photo(local_path: str | Path, filename: str) -> None:
