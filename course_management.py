@@ -94,11 +94,37 @@ def query(sql: str, params=()) -> pd.DataFrame:
         conn.close()
 
 
+def _backfill_one_to_one_students(conn: sqlite3.Connection) -> int:
+    """给还没有学生档案的一对一学生，补建/关联 students 记录（幂等，不覆盖已有数据）。"""
+    n = 0
+    try:
+        rows = conn.execute(
+            "SELECT id, name, grade FROM one_to_one_students WHERE student_id IS NULL"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return 0
+    for oid, name, grade in rows:
+        sid = conn.execute(
+            "SELECT id FROM students WHERE TRIM(name)=? ORDER BY id LIMIT 1", (name,)
+        ).fetchone()
+        if sid:
+            sid = int(sid[0])
+        else:
+            cur = conn.execute("INSERT INTO students(name, grade, school) VALUES(?,?,?)", (name, grade or "", ""))
+            sid = int(cur.lastrowid)
+        conn.execute("UPDATE one_to_one_students SET student_id=? WHERE id=?", (sid, int(oid)))
+        n += 1
+    return n
+
+
 def init_course_db(db_path: str | Path | None = None) -> None:
     if db_path is not None:
         configure(db_path)
     conn = _connect()
     try:
+        if _backfill_one_to_one_students(conn):
+            conn.commit()
+            cloud_store.save_database(DB_PATH)
         version = int(conn.execute("PRAGMA user_version").fetchone()[0])
         view_exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type='view' AND name='v_lessons'").fetchone()
         hour_table_exists = conn.execute(
@@ -1491,11 +1517,19 @@ def page_targets() -> None:
                         st.error("请填写学生姓名")
                     else:
                         try:
-                            run("""INSERT INTO one_to_one_students
-                                   (name, grade, subject, total_hours, status, contact, note)
-                                   VALUES(?,?,?,?,?,?,?)""",
-                                (name.strip(), grade.strip(), subject.strip(), float(total_hours),
-                                 "在读", contact.strip(), note.strip()))
+                            new_id = run("""INSERT INTO one_to_one_students
+                                            (name, grade, subject, total_hours, status, contact, note)
+                                            VALUES(?,?,?,?,?,?,?)""",
+                                         (name.strip(), grade.strip(), subject.strip(), float(total_hours),
+                                          "在读", contact.strip(), note.strip()))
+                            # 同步建立学生档案(便于成绩录入、账号等统一使用)
+                            hit = query("SELECT id FROM students WHERE TRIM(name)=? ORDER BY id LIMIT 1", (name.strip(),))
+                            if hit.empty:
+                                sid = run("INSERT INTO students(name, grade, school) VALUES(?,?,?)",
+                                          (name.strip(), grade.strip(), ""))
+                            else:
+                                sid = int(hit["id"].iloc[0])
+                            run("UPDATE one_to_one_students SET student_id=? WHERE id=?", (sid, new_id))
                             st.rerun()
                         except sqlite3.IntegrityError:
                             st.error("这个学生名称已经存在")

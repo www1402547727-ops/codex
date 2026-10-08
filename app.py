@@ -152,10 +152,13 @@ CREATE VIEW v_lessons AS
 """
 ADD_COLS = {
     "students": {"grade": "TEXT DEFAULT ''", "contact": "TEXT DEFAULT ''",
-                 "status": "TEXT DEFAULT '在读'", "note": "TEXT DEFAULT ''"},
-    "exams": {"class_id": "INTEGER", "category": "TEXT DEFAULT ''"},
+                 "status": "TEXT DEFAULT '在读'", "note": "TEXT DEFAULT ''",
+                 "school": "TEXT DEFAULT ''"},
+    "exams": {"class_id": "INTEGER", "category": "TEXT DEFAULT ''",
+              "school": "TEXT DEFAULT ''", "grade": "TEXT DEFAULT ''"},
     "classes": {"kind": "TEXT DEFAULT '班课'"},
     "lessons": {"plan_id": "INTEGER"},
+    "scores": {"status": "TEXT DEFAULT ''"},
 }
 
 
@@ -195,6 +198,19 @@ def init_db():
         for col, typ in cols.items():
             if col not in have:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+    # 同一场考试 + 同一个学生只保留一条成绩（历史重复先合并，再建唯一索引）
+    conn.execute("""DELETE FROM scores WHERE id NOT IN (
+                        SELECT id FROM (
+                            SELECT id, ROW_NUMBER() OVER (
+                                       PARTITION BY exam_id, student_id
+                                       ORDER BY (score IS NOT NULL) DESC,
+                                                (COALESCE(wrong_qs,'')||COALESCE(knowledge,'')||COALESCE(paper,'')) <> '' DESC,
+                                                id DESC) rn
+                            FROM scores WHERE exam_id IS NOT NULL AND student_id IS NOT NULL) WHERE rn = 1)""")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_scores_exam_student ON scores(exam_id, student_id)")
+    # 老成绩没有 status 字段：有分数=已录入，没分数=未录入（空不等于 0 分）
+    conn.execute("UPDATE scores SET status='已录入' WHERE COALESCE(status,'')='' AND score IS NOT NULL")
+    conn.execute("UPDATE scores SET status='未录入' WHERE COALESCE(status,'')=''")
     # 考试分类：首次使用时给几个常用分类
     if conn.execute("SELECT COUNT(*) FROM exam_categories").fetchone()[0] == 0:
         for i, nm in enumerate(["月考", "期中", "期末", "模拟考", "随堂测", "其他"]):
@@ -763,8 +779,9 @@ def page_students():
         with st.form("new_stu"):
             names = st.text_area("姓名(每行一个,可一次导入整班)", height=100)
             c1, c2 = st.columns(2)
-            grade = c1.text_input("年级")
-            contact = c2.text_input("联系方式(只导入一个学生时填)")
+            sch_in = c1.text_input("学校")
+            grade = c2.text_input("年级")
+            contact = st.text_input("联系方式(只导入一个学生时填)")
             join = st.multiselect("加入班级", cls.id.tolist(), format_func=dict(zip(cls.id, cls.name)).get)
             if st.form_submit_button("添加"):
                 lst = [x.strip() for x in names.splitlines() if x.strip()]
@@ -775,7 +792,8 @@ def page_students():
                         sid = int(hit["id"].iloc[0])
                         reused += 1
                     else:
-                        sid = run("INSERT INTO students(name, grade, contact) VALUES(?,?,?)", (n, grade, contact))
+                        sid = run("INSERT INTO students(name, grade, contact, school) VALUES(?,?,?,?)",
+                                  (n, grade, contact, sch_in.strip()))
                         added += 1
                     for c in join:
                         run("INSERT OR IGNORE INTO class_members VALUES(?,?)", (int(c), sid))
@@ -806,7 +824,7 @@ def page_students():
                 st.success("名单已保存")
                 st.rerun()
     flt = st.radio("状态", ["在读", "停课", "全部"], horizontal=True)
-    df = query("""SELECT s.id, s.name 姓名, s.grade 年级, s.status 状态, s.contact 联系方式,
+    df = query("""SELECT s.id, s.name 姓名, s.school 学校, s.grade 年级, s.status 状态, s.contact 联系方式,
                   (SELECT GROUP_CONCAT(c.name, '、') FROM class_members m JOIN classes c ON c.id=m.class_id
                    WHERE m.student_id=s.id) 班级 FROM students s ORDER BY s.name""")
     if flt != "全部":
@@ -823,11 +841,12 @@ def page_students():
             n = c1.text_input("姓名", s["name"])
             g = c2.text_input("年级", s.grade or "")
             stt = c3.selectbox("状态", ["在读", "停课"], index=0 if s.status != "停课" else 1)
+            sch = st.text_input("学校", (s["school"] or "") if "school" in s.index else "")
             ct = st.text_input("联系方式", s.contact or "")
             nt = st.text_area("备注", s.note or "", height=80)
             if st.form_submit_button("保存"):
-                run("UPDATE students SET name=?, grade=?, status=?, contact=?, note=? WHERE id=?",
-                    (n.strip(), g, stt, ct, nt, int(sid)))
+                run("UPDATE students SET name=?, grade=?, status=?, contact=?, note=?, school=? WHERE id=?",
+                    (n.strip(), g, stt, ct, nt, sch.strip(), int(sid)))
                 st.rerun()
     with t2:
         lz = query("""SELECT lesson_date 日期, cname 班级, seq 第几节, hours 课时, content 内容, mastery 掌握情况, homework 作业
@@ -902,27 +921,156 @@ def pick_exam(key):
         return None
     subs = sorted({str(x) for x in ex["subject"].fillna("") if str(x).strip()})
     cats = sorted({str(x) for x in ex["category"].fillna("") if str(x).strip()})
+    schools = sorted({str(x) for x in ex.get("school").fillna("") if str(x).strip()}) if "school" in ex.columns else []
+    grades = sorted({str(x) for x in ex.get("grade").fillna("") if str(x).strip()}) if "grade" in ex.columns else []
     f1, f2 = st.columns(2)
     sub = f1.selectbox("科目", ["全部"] + subs, key=f"{key}_subj")
     cat = f2.selectbox("分类", ["全部"] + cats, key=f"{key}_cat")
+    f3, f4 = st.columns(2)
+    sch = f3.selectbox("学校", ["全部"] + schools, key=f"{key}_school")
+    grd = f4.selectbox("年级", ["全部"] + grades, key=f"{key}_grade")
     view = ex
     if sub != "全部":
         view = view[view["subject"].fillna("") == sub]
     if cat != "全部":
         view = view[view["category"].fillna("") == cat]
+    if sch != "全部":
+        view = view[view["school"].fillna("") == sch]
+    if grd != "全部":
+        view = view[view["grade"].fillna("") == grd]
     if view.empty:
-        st.info("这个筛选条件下没有考试，换个科目或分类试试。")
+        st.info("这个筛选条件下没有考试，换个条件试试。")
         return None
-    lab = labels(view, lambda r: f"{r['exam_date']} {r['name']} {r['cname']}({r['subject']})")
+
+    def _exam_label(r):
+        loc = " ".join(str(x) for x in (r.get("school", ""), r.get("grade", "")) if str(x).strip())
+        return f"{r['exam_date']} {r['name']}" + (f" · {loc}" if loc else "") + f"（{r['subject']}）"
+
+    lab = labels(view, _exam_label)
     eid = st.selectbox("考试", list(lab), format_func=lab.get, key=key)
     return view[view.id == eid].iloc[0]
 
 
+def row_val(row, key, default=""):
+    """从 pandas Series 里安全取值（列不存在或为 NaN 时返回 default）。"""
+    try:
+        v = row[key]
+    except Exception:
+        return default
+    if v is None:
+        return default
+    try:
+        if pd.isna(v):
+            return default
+    except Exception:
+        pass
+    return v
+
+
+def score_state(row):
+    """一条成绩记录的状态：缺考 / 已录入 / 未录入。"""
+    if row is None:
+        return "未录入"
+    stt = str(row_val(row, "status", "") or "").strip()
+    if stt == "缺考":
+        return "缺考"
+    if stt == "已录入":
+        return "已录入"
+    return "已录入" if pd.notna(row_val(row, "score", None)) else "未录入"
+
+
+def teach_map(student_ids):
+    """返回 {student_id: {"kind": 教学类型, "class": 班级名}}，一对一学生也不会有班级。"""
+    ids = [int(x) for x in student_ids]
+    info = {i: {"classes": [], "o2o": False} for i in ids}
+    if not ids:
+        return {}
+    q = ",".join("?" * len(ids))
+    rows = query(f"""SELECT m.student_id sid, c.name cname FROM class_members m
+                     JOIN classes c ON c.id=m.class_id WHERE m.student_id IN ({q})""", tuple(ids))
+    for _, r in rows.iterrows():
+        info[int(r["sid"])]["classes"].append(str(r["cname"]))
+    try:
+        rows2 = query(f"""SELECT student_id sid FROM one_to_one_students
+                          WHERE student_id IN ({q})""", tuple(ids))
+        for x in rows2["sid"].tolist():
+            if int(x) in info:
+                info[int(x)]["o2o"] = True
+    except Exception:
+        pass
+    out = {}
+    for sid, d in info.items():
+        kinds = []
+        if d["classes"]:
+            kinds.append("班课")
+        if d["o2o"]:
+            kinds.append("一对一")
+        out[sid] = {"kind": "·".join(kinds) if kinds else "—",
+                    "class": "、".join(d["classes"]) if d["classes"] else "—"}
+    return out
+
+
 def exam_students(ex):
-    if pd.notna(ex["class_id"]):
+    """考试名单：优先按「学校 + 年级」取全部在读学生（含一对一）；
+    老考试没填学校/年级时，回退到原来的班级名单。"""
+    school = str(row_val(ex, "school", "") or "").strip()
+    grade = str(row_val(ex, "grade", "") or "").strip()
+    if school or grade:
+        sql = "SELECT * FROM students WHERE status='在读'"
+        params = []
+        if school:
+            sql += " AND TRIM(COALESCE(school,''))=?"
+            params.append(school)
+        if grade:
+            sql += " AND TRIM(COALESCE(grade,''))=?"
+            params.append(grade)
+        sql += " ORDER BY name"
+        return query(sql, tuple(params))
+    cid = row_val(ex, "class_id", None)
+    if cid is not None and pd.notna(cid):
         return query("""SELECT s.* FROM students s JOIN class_members m ON m.student_id=s.id
-                        WHERE m.class_id=? AND s.status='在读' ORDER BY s.name""", (int(ex["class_id"]),))
+                        WHERE m.class_id=? AND s.status='在读' ORDER BY s.name""", (int(cid),))
     return query("SELECT * FROM students WHERE status='在读' ORDER BY name")
+
+
+def save_entry_changes(eid, changes, old_map):
+    """按「未录入 / 已录入 / 缺考」三态保存成绩。
+
+    changes: [{"sid": 学生id, "status": 状态, "score": 分数或None}]
+    返回 (已录入人数, 缺考人数, 清空人数, 跳过人数)。
+    同一场考试同一学生只有一条记录（scores 上有唯一索引），所以不会重复扣分。
+    """
+    saved = absent = cleared = skipped = 0
+    for ch in changes:
+        sid = int(ch["sid"])
+        stt = str(ch.get("status") or "未录入").strip()
+        sc = ch.get("score")
+        has_score = sc is not None and pd.notna(sc)
+        o = old_map.get(sid)
+        exist = o is not None
+        if stt == "缺考":
+            if not exist or score_state(o) != "缺考":
+                run("""INSERT INTO scores(student_id, exam_id, score, status) VALUES(?,?,NULL,'缺考')
+                       ON CONFLICT(exam_id, student_id) DO UPDATE SET score=NULL, status='缺考'""", (sid, eid))
+                absent += 1
+        elif stt == "已录入" or has_score:
+            if not has_score:
+                skipped += 1
+                continue
+            new_val = float(sc)
+            same = (exist and score_state(o) == "已录入"
+                    and pd.notna(row_val(o, "score", None))
+                    and abs(float(row_val(o, "score", 0)) - new_val) < 1e-9)
+            if not same:
+                run("""INSERT INTO scores(student_id, exam_id, score, status) VALUES(?,?,?,'已录入')
+                       ON CONFLICT(exam_id, student_id) DO UPDATE SET score=excluded.score, status='已录入'""",
+                    (sid, eid, new_val))
+                saved += 1
+        else:
+            if exist:
+                run("DELETE FROM scores WHERE student_id=? AND exam_id=?", (sid, eid))
+                cleared += 1
+    return saved, absent, cleared, skipped
 
 
 def tab_entry():
@@ -931,48 +1079,82 @@ def tab_entry():
         return
     eid, full = int(ex["id"]), float(ex["full_score"])
     stu = exam_students(ex)
-    done = set(query("SELECT student_id FROM scores WHERE exam_id=?", (eid,)).student_id)
-    st.subheader("快速录分")
-    todo = stu[~stu.id.isin(done)]
-    if todo.empty:
-        st.success("这场考试的学生都录过分了")
-    else:
-        df = pd.DataFrame({"姓名": todo["name"].values, "得分": [float("nan")] * len(todo)}, index=todo.id.values)
-        ed = st.data_editor(df, disabled=["姓名"], hide_index=True, use_container_width=True, key=f"q{eid}",
-                            column_config={"得分": st.column_config.NumberColumn(min_value=0.0, max_value=full, step=0.5)})
-        if st.button("保存这些成绩", type="primary"):
-            n = 0
-            for sid, row in ed.iterrows():
-                if pd.notna(row["得分"]):
-                    run("INSERT INTO scores(student_id, exam_id, score) VALUES(?,?,?)", (int(sid), eid, float(row["得分"])))
-                    n += 1
-            st.success(f"保存了 {n} 人")
-            st.rerun()
-    with st.expander("单个学生详细录入(错题/错因/知识点/试卷和答题卡照片)"):
-        if stu.empty:
-            st.info("这场考试没有可选学生,先到「班级」里加名单")
-            return
-        sid = st.selectbox("学生", stu.id.tolist(), format_func=dict(zip(stu.id, stu["name"])).get)
+    scope_school = str(row_val(ex, "school", "") or "未填")
+    scope_grade = str(row_val(ex, "grade", "") or "未填")
+    if stu.empty:
+        st.warning("这场考试没有匹配到学生。")
+        st.caption(f"考试范围：学校「{scope_school}」年级「{scope_grade}」。"
+                   f"请到「学生」页把学生的学校和年级改成一致（一对一学生也会一起进来）。")
+        return
+    info = teach_map(stu["id"].tolist())
+    olds = query("SELECT * FROM scores WHERE exam_id=?", (eid,))
+    old_map = {int(r["student_id"]): r for _, r in olds.iterrows()}
+    rows = []
+    for _, s in stu.iterrows():
+        sid = int(s["id"])
+        o = old_map.get(sid)
+        val = None
+        if o is not None and pd.notna(row_val(o, "score", None)):
+            try:
+                val = float(o["score"])
+            except Exception:
+                val = None
+        rows.append({"学生": s["name"], "教学类型": info.get(sid, {}).get("kind", "—"),
+                     "班级": info.get(sid, {}).get("class", "—"), "成绩": val,
+                     "状态": score_state(o), "_sid": sid})
+    df = pd.DataFrame(rows).set_index("_sid")
+    st.subheader("录入成绩")
+    st.caption(f"名单范围：学校「{scope_school}」· 年级「{scope_grade}」· 共 {len(df)} 人。"
+               "未录入 = 还没录（不是 0 分）；已录入 = 填了分数；缺考 = 确认没参加。")
+    ed = st.data_editor(
+        df, hide_index=True, use_container_width=True, key=f"entry{eid}",
+        disabled=["学生", "教学类型", "班级"],
+        column_config={
+            "成绩": st.column_config.NumberColumn(min_value=0.0, max_value=full, step=0.5, help=f"满分 {full:g}"),
+            "状态": st.column_config.SelectboxColumn(options=["未录入", "已录入", "缺考"]),
+        },
+    )
+    if st.button("💾 保存成绩", type="primary", key=f"save{eid}"):
+        changes = [{"sid": int(sid), "status": str(r["状态"] or "未录入").strip(),
+                    "score": (None if pd.isna(r["成绩"]) else float(r["成绩"]))}
+                   for sid, r in ed.iterrows()]
+        saved, absent, cleared, skipped = save_entry_changes(eid, changes, old_map)
+        msg = f"已录入 {saved} 人，缺考 {absent} 人，清空 {cleared} 人"
+        if skipped:
+            msg += f"；{skipped} 人状态是「已录入」但没填分数，已跳过"
+        st.success(msg)
+        st.rerun()
+
+    st.divider()
+    with st.expander("单个学生详细录入（错题 / 错因 / 知识点 / 试卷和答题卡照片）"):
+        sid = st.selectbox("学生", stu.id.tolist(), format_func=dict(zip(stu.id, stu["name"])).get,
+                           key=f"detail{eid}")
         old = query("SELECT * FROM scores WHERE student_id=? AND exam_id=?", (int(sid), eid))
         o = old.iloc[0] if len(old) else None
-        score = st.number_input(f"得分(满分 {full:g})", 0.0, full, float(o.score) if o is not None else 0.0, 0.5, key=f"sc{sid}{eid}")
-        wrong = st.text_input("错题题号(如 5,12,18)", o.wrong_qs if o is not None else "", key=f"w{sid}{eid}")
-        reasons = st.multiselect("错因", REASONS, [x for x in (o.reasons.split(",") if o is not None and o.reasons else []) if x in REASONS], key=f"r{sid}{eid}")
-        knowledge = st.text_input("涉及知识点", o.knowledge if o is not None else "", key=f"k{sid}{eid}")
+        cur_score = float(row_val(o, "score", 0.0)) if (o is not None and pd.notna(row_val(o, "score", None))) else 0.0
+        score = st.number_input(f"得分(满分 {full:g})", 0.0, full, cur_score, 0.5, key=f"sc{sid}{eid}")
+        wrong = st.text_input("错题题号(如 5,12,18)", row_val(o, "wrong_qs", "") if o is not None else "", key=f"w{sid}{eid}")
+        reasons = st.multiselect("错因", REASONS,
+                                 [x for x in (str(row_val(o, "reasons", "")).split(",") if o is not None else []) if x in REASONS],
+                                 key=f"r{sid}{eid}")
+        knowledge = st.text_input("涉及知识点", row_val(o, "knowledge", "") if o is not None else "", key=f"k{sid}{eid}")
         paper = st.file_uploader("试卷照片/PDF(可多张)", type=["jpg", "jpeg", "png", "pdf"], accept_multiple_files=True, key=f"p{sid}{eid}")
         sheet = st.file_uploader("答题卡照片/PDF(可多张)", type=["jpg", "jpeg", "png", "pdf"], accept_multiple_files=True, key=f"s{sid}{eid}")
-        note = st.text_input("备注", o.note if o is not None else "", key=f"n{sid}{eid}")
-        if st.button("保存这个学生的详细记录"):
+        note = st.text_input("备注", row_val(o, "note", "") if o is not None else "", key=f"n{sid}{eid}")
+        if st.button("保存这个学生的详细记录", key=f"dsc{sid}{eid}"):
             tag = f"e{eid}_s{sid}"
             p, s = save_photos(paper, tag + "_paper"), save_photos(sheet, tag + "_sheet")
             if o is None:
-                run("""INSERT INTO scores(student_id, exam_id, score, wrong_qs, reasons, knowledge, paper, sheet, note)
-                       VALUES(?,?,?,?,?,?,?,?,?)""", (int(sid), eid, score, wrong, ",".join(reasons), knowledge, p, s, note))
+                run("""INSERT INTO scores(student_id, exam_id, score, status, wrong_qs, reasons, knowledge, paper, sheet, note)
+                       VALUES(?,?,?,'已录入',?,?,?,?,?,?)""",
+                    (int(sid), eid, score, wrong, ",".join(reasons), knowledge, p, s, note))
             else:
-                run("""UPDATE scores SET score=?, wrong_qs=?, reasons=?, knowledge=?, note=?,
+                run("""UPDATE scores SET score=?, status='已录入', wrong_qs=?, reasons=?, knowledge=?, note=?,
                        paper=CASE WHEN ?='' THEN paper ELSE ? END, sheet=CASE WHEN ?='' THEN sheet ELSE ? END
-                       WHERE id=?""", (score, wrong, ",".join(reasons), knowledge, note, p, p, s, s, int(o.id)))
+                       WHERE id=?""",
+                    (score, wrong, ",".join(reasons), knowledge, note, p, p, s, s, int(o["id"])))
             st.success("已保存")
+            st.rerun()
 
 
 def tab_analysis():
@@ -980,15 +1162,24 @@ def tab_analysis():
     if ex is None:
         return
     eid, full = int(ex["id"]), float(ex["full_score"])
-    df = query("SELECT s.id sid, s.name 姓名, sc.score 得分 FROM scores sc JOIN students s ON s.id=sc.student_id WHERE sc.exam_id=?", (eid,))
-    if df.empty:
+    raw = query("""SELECT s.id sid, s.name 姓名, sc.score 得分, COALESCE(sc.status,'') status
+                   FROM scores sc JOIN students s ON s.id=sc.student_id WHERE sc.exam_id=?""", (eid,))
+    if raw.empty:
         st.info("这场考试还没有成绩")
         return
+    absent_n = int((raw["status"] == "缺考").sum())
+    df = raw[(raw["status"] != "缺考") & raw["得分"].notna()].copy()
+    if df.empty:
+        st.info("这场考试还没有录入任何分数（缺考不计入统计）。")
+        return
+    info = teach_map(df["sid"].tolist())
+    df["教学类型"] = [info.get(int(x), {}).get("kind", "—") for x in df["sid"]]
+    df["班级"] = [info.get(int(x), {}).get("class", "—") for x in df["sid"]]
     df["得分率"] = (df["得分"] / full * 100).round(1)
     df["排名"] = df["得分"].rank(ascending=False, method="min").astype(int)
     prev = query("""SELECT sc.student_id sid, sc.score / e.full_score * 100 prate FROM scores sc
                     JOIN exams e ON e.id=sc.exam_id
-                    WHERE e.subject=? AND (e.exam_date<? OR (e.exam_date=? AND e.id<?))
+                    WHERE e.subject=? AND sc.score IS NOT NULL AND (e.exam_date<? OR (e.exam_date=? AND e.id<?))
                     ORDER BY e.exam_date, e.id""", (ex["subject"], ex["exam_date"], ex["exam_date"], eid)).drop_duplicates("sid", keep="last")
     df = df.merge(prev, on="sid", how="left")
     df["较上次(得分率)"] = (df["得分率"] - df["prate"]).round(1)
@@ -998,17 +1189,39 @@ def tab_analysis():
     m[1].metric("最高分", f"{df['得分'].max():g}")
     m[2].metric("最低分", f"{df['得分'].min():g}")
     m[3].metric("参考人数", len(df))
-    st.dataframe(df.sort_values("排名")[["排名", "姓名", "得分", "得分率", "较上次(得分率)"]],
+    if absent_n:
+        st.caption(f"另有 {absent_n} 人标记为缺考（不计入平均分）。")
+    st.dataframe(df.sort_values("排名")[["排名", "姓名", "教学类型", "班级", "得分", "得分率", "较上次(得分率)"]],
                  hide_index=True, use_container_width=True)
     st.bar_chart(df.set_index("姓名")["得分"])
 
 
 def tab_student():
-    stu = query("SELECT id, name FROM students ORDER BY name")
+    stu = query("""SELECT s.id, s.name, COALESCE(s.school,'') school, COALESCE(s.grade,'') grade
+                   FROM students s ORDER BY s.name""")
     if stu.empty:
         st.info("还没有学生")
         return
-    sid = st.selectbox("学生", stu.id.tolist(), format_func=dict(zip(stu.id, stu["name"])).get, key="rep_stu")
+    info = teach_map(stu["id"].tolist())
+    stu = stu.copy()
+    stu["教学类型"] = [info.get(int(x), {}).get("kind", "—") for x in stu["id"]]
+    schools = sorted({str(x) for x in stu["school"] if str(x).strip()})
+    grades = sorted({str(x) for x in stu["grade"] if str(x).strip()})
+    c1, c2, c3 = st.columns(3)
+    sch = c1.selectbox("学校", ["全部"] + schools, key="rep_school")
+    grd = c2.selectbox("年级", ["全部"] + grades, key="rep_grade")
+    kind = c3.selectbox("教学类型", ["全部", "班课", "一对一"], key="rep_kind")
+    view = stu
+    if sch != "全部":
+        view = view[view["school"] == sch]
+    if grd != "全部":
+        view = view[view["grade"] == grd]
+    if kind != "全部":
+        view = view[view["教学类型"].str.contains(kind, regex=False)]
+    if view.empty:
+        st.info("这个筛选条件下没有学生")
+        return
+    sid = st.selectbox("学生", view.id.tolist(), format_func=dict(zip(view.id, view["name"])).get, key="rep_stu")
     student_report(sid)
 
 
@@ -1055,20 +1268,26 @@ def tab_manage():
         n = c1.text_input("考试名称")
         d = c2.date_input("日期", date.today())
         s = c3.selectbox("科目", SUBJECTS)
+        c6, c7 = st.columns(2)
+        school = c6.text_input("学校", placeholder="例如：XX中学")
+        grade = c7.text_input("年级", placeholder="例如：初三")
         c4, c5 = st.columns(2)
         cat = c4.selectbox("分类", [""] + cat_names, format_func=lambda x: x or "未分类")
         f = c5.number_input("满分", 1.0, 300.0, 100.0, 5.0)
-        c = st.selectbox("所属班级(选了才能统计班级排名和「待录成绩」)", [0] + cls_ids,
+        c = st.selectbox("所属班级(可不选)", [0] + cls_ids,
                          format_func=lambda i: "不限班级" if i == 0 else cls_map.get(i, str(i)))
+        st.caption("填了学校和年级后，录分名单=该学校该年级的全部学生（班课 + 一对一都会进来）。")
         if st.form_submit_button("添加考试", type="primary") and n.strip():
-            run("""INSERT INTO exams(name, exam_date, subject, full_score, class_id, category)
-                   VALUES(?,?,?,?,?,?)""", (n.strip(), str(d), s, f, c or None, cat))
+            run("""INSERT INTO exams(name, exam_date, subject, full_score, class_id, category, school, grade)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (n.strip(), str(d), s, f, c or None, cat, school.strip(), grade.strip()))
             st.session_state["exam_msg"] = f"已添加考试「{n.strip()}」"
             st.rerun()
 
     # ---------- 列表 + 筛选 ----------
     all_ex = query("""SELECT e.id, e.exam_date, e.name, e.subject, COALESCE(e.category,'') category,
-                             e.full_score, COALESCE(c.name,'不限') cname
+                             e.full_score, COALESCE(e.school,'') school, COALESCE(e.grade,'') grade,
+                             COALESCE(c.name,'') cname
                       FROM exams e LEFT JOIN classes c ON c.id=e.class_id
                       ORDER BY e.exam_date DESC, e.id DESC""")
     if all_ex.empty:
@@ -1087,8 +1306,9 @@ def tab_manage():
     show = view.copy()
     show["分类"] = show["category"].replace("", "未分类")
     st.dataframe(
-        show[["exam_date", "name", "subject", "分类", "full_score", "cname"]].rename(
-            columns={"exam_date": "日期", "name": "考试", "subject": "科目", "full_score": "满分", "cname": "班级"}),
+        show[["exam_date", "name", "school", "grade", "subject", "分类", "full_score", "cname"]].rename(
+            columns={"exam_date": "日期", "name": "考试", "school": "学校", "grade": "年级",
+                     "subject": "科目", "full_score": "满分", "cname": "班级"}),
         hide_index=True, use_container_width=True,
     )
     if view.empty:
@@ -1113,6 +1333,9 @@ def tab_manage():
         n2 = c1.text_input("考试名称", str(ex["name"]))
         d2 = c2.date_input("日期", cur_date)
         s2 = c3.selectbox("科目", subj_opts, index=subj_opts.index(cur_subj))
+        c6, c7 = st.columns(2)
+        school2 = c6.text_input("学校", str(ex["school"] or "") if "school" in ex.index else "")
+        grade2 = c7.text_input("年级", str(ex["grade"] or "") if "grade" in ex.index else "")
         c4, c5 = st.columns(2)
         cat_opts = [""] + cat_names
         cur_cat = str(ex["category"] or "")
@@ -1123,8 +1346,9 @@ def tab_manage():
                            format_func=lambda i: "不限班级" if i == 0 else cls_map.get(i, str(i)))
         b1, b2 = st.columns(2)
         if b1.form_submit_button("💾 保存修改", type="primary"):
-            run("""UPDATE exams SET name=?, exam_date=?, subject=?, full_score=?, class_id=?, category=?
-                   WHERE id=?""", (n2.strip(), str(d2), s2, f2v, c2v or None, cat2, int(pick)))
+            run("""UPDATE exams SET name=?, exam_date=?, subject=?, full_score=?, class_id=?, category=?, school=?, grade=?
+                   WHERE id=?""",
+                (n2.strip(), str(d2), s2, f2v, c2v or None, cat2, school2.strip(), grade2.strip(), int(pick)))
             st.session_state["exam_msg"] = f"考试「{n2.strip()}」已保存"
             st.rerun()
         if b2.form_submit_button("🗑 删除这场考试"):
