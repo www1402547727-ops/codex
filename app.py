@@ -1415,15 +1415,7 @@ def page_me() -> None:
     st.title("我的")
     st.caption(f"{um.ROLE_LABELS.get(me.get('role'), '')}：{me.get('username') or ''}")
 
-    st.markdown("#### ⚡ 快捷入口")
-    with st.container(key="me_quick"):
-        for pair in (["学生", "授课统计"], ["账号管理", "账号资料"]):
-            cols = st.columns(2)
-            for col, label in zip(cols, pair):
-                target = "账号" if label == "账号资料" else label
-                if col.button(label, use_container_width=True, key=f"me_{target}"):
-                    st.session_state["mobile_extra"] = target
-                    st.rerun()
+    st.caption("所有页面都在侧边栏「导航」里：手机点左上角「>」即可展开。")
 
     today = date.today()
     st.markdown("#### 🔔 待办提醒")
@@ -1435,7 +1427,7 @@ def page_me() -> None:
         st.button(
             f"⚠️ 过去 30 天有 {overdue} 节课还没确认「已上课」→ 去处理",
             use_container_width=True, key="me_overdue",
-            on_click=lambda: st.session_state.update(mobile_extra=None, page="课程表"),
+            on_click=lambda: st.session_state.update(page="课程表"),
         )
     else:
         st.success("没有待确认的课程")
@@ -1473,36 +1465,11 @@ def page_me() -> None:
 
 
 if user["role"] == um.ROLE_TEACHER:
-    MOBILE_TABS = {"首页": "首页", "课表": "课程表", "教学": "教学对象", "成绩": "成绩", "我的": "我的"}
-    MOBILE_EXTRA = ["学生", "授课统计", "账号管理", "账号"]
+    NAV = dict(PAGES)
+    if cm.is_mobile():
+        NAV["我的"] = page_me          # 待办提醒 / 课时预警 / 本月速览
 else:
-    MOBILE_TABS = {"我的课程": "我的课程", "成绩": "我的成绩", "账号": "账号"}
-    MOBILE_EXTRA = []
+    NAV = dict(PAGES)
 
-if cm.is_mobile():
-    extra = st.session_state.get("mobile_extra")
-    if extra in MOBILE_EXTRA:
-        if st.button("← 返回", key="mobile_back"):
-            st.session_state.pop("mobile_extra", None)
-            st.rerun()
-        st.divider()
-        PAGES[extra]()
-    else:
-        tab_labels = list(MOBILE_TABS)
-        with st.container(key="bottomnav"):
-            tab = st.segmented_control(
-                "导航", tab_labels, default=tab_labels[0], key="mobile_tab",
-                label_visibility="collapsed",
-            )
-        target = MOBILE_TABS.get(tab or tab_labels[0], tab_labels[0])
-        if target == "我的":
-            page_me()
-        elif target == "成绩":
-            page_exams()
-        elif target == "我的成绩":
-            um.page_student_scores()
-        else:
-            PAGES[target]()
-else:
-    page = st.sidebar.radio("导航", list(PAGES), key="page")
-    PAGES[page]()
+page = st.sidebar.radio("导航", list(NAV), key="page")
+NAV[page]()

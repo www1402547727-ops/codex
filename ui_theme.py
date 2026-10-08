@@ -177,18 +177,7 @@ table.month2 .mini { display: block; color: var(--chalk-ink); overflow: hidden; 
 table.month2 .mini.done { color: var(--green); }
 .tiny-note { color: var(--faint); font-size: .78rem; }
 
-/* ---------- 手机底部导航 + 「我的」页 ---------- */
-.st-key-bottomnav { position: fixed; left: 0; right: 0; bottom: 0; z-index: 1000;
-  background: var(--card); border-top: 1px solid var(--line);
-  padding: 6px 8px calc(8px + env(safe-area-inset-bottom)); }
-.st-key-bottomnav .stElementContainer, .st-key-bottomnav [data-testid="stButtonGroup"], .st-key-bottomnav [role="radiogroup"] { width: 100% !important; }
-.st-key-bottomnav [role="radiogroup"], .st-key-bottomnav [data-testid="stButtonGroup"] { display: flex !important; gap: 4px !important; }
-.st-key-bottomnav button { flex: 1 1 0 !important; min-width: 0 !important; font-size: .9rem !important;
-  min-height: 3rem !important; padding: 10px 2px !important; justify-content: center !important;
-  border: none !important; background: transparent !important; color: var(--muted) !important; border-radius: 10px !important; }
-.st-key-bottomnav button p { font-size: .9rem !important; line-height: 1.2 !important; }
-.st-key-bottomnav button[kind$="Active"], .st-key-bottomnav button[aria-checked="true"], .st-key-bottomnav button[aria-pressed="true"] {
-  background: var(--green-soft) !important; color: var(--green) !important; font-weight: 700 !important; }
+/* ---------- 「我的」页 ---------- */
 [class*="me_quick"] [data-testid="stHorizontalBlock"], [class*="me_month"] [data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; width: 100% !important; }
 [class*="me_quick"] [data-testid="stColumn"], [class*="me_month"] [data-testid="stColumn"] { min-width: 0 !important; flex: 1 1 0 !important; width: auto !important; }
 [class*="me_quick"] .stElementContainer, [class*="me_month"] .stElementContainer, [class*="me_quick"] button, [class*="me_month"] button { width: 100% !important; min-width: 0 !important; }
@@ -208,11 +197,9 @@ table.month2 .mini.done { color: var(--green); }
 
 /* ---------- 手机 ---------- */
 @media (max-width: 760px) {
-  .block-container { padding: .6rem .8rem 7.5rem !important; }
-  /* 手机底部导航放大：更好点 */
-  .st-key-bottomnav { padding: 8px 8px calc(10px + env(safe-area-inset-bottom)); }
-  .st-key-bottomnav button { min-height: 3.4rem !important; font-size: .95rem !important; }
-  .st-key-bottomnav button p { font-size: .95rem !important; }
+  .block-container { padding: .6rem .8rem 1.6rem !important; }
+  /* 侧边栏导航：手机上字大一点、好点 */
+  [data-testid="stSidebar"] [role="radiogroup"] label { font-size: 1.02rem !important; padding: .3rem 0 !important; }
   [data-testid="stMainBlockContainer"] { padding-top: .4rem !important; }
   h1, [data-testid="stHeading"] h1 { font-size: 1.45rem !important; }
   h2, [data-testid="stHeading"] h2 { font-size: 1.15rem !important; }
