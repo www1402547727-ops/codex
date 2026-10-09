@@ -1000,6 +1000,11 @@ def score_state(row):
     return "已录入" if pd.notna(row_val(row, "score", None)) else "未录入"
 
 
+def file_count(joined) -> int:
+    """已保存的附件数量（用 | 分隔）。"""
+    return len([x for x in str(joined or "").split("|") if x.strip()])
+
+
 def teach_map(student_ids):
     """返回 {student_id: {"kind": 教学类型, "class": 班级名}}，一对一学生也不会有班级。"""
     ids = [int(x) for x in student_ids]
@@ -1277,6 +1282,9 @@ def tab_entry():
     ex = pick_exam("in_exam")
     if ex is None:
         return
+    _flash = st.session_state.pop("entry_msg", None)
+    if _flash:
+        st.success(_flash)
     eid, full = int(ex["id"]), float(ex["full_score"])
     stu = exam_students(ex)
     scope_school = str(row_val(ex, "school", "") or "未填")
@@ -1301,14 +1309,16 @@ def tab_entry():
                 val = None
         rows.append({"学生": s["name"], "教学类型": info.get(sid, {}).get("kind", "—"),
                      "班级": info.get(sid, {}).get("class", "—"), "成绩": val,
-                     "状态": score_state(o), "_sid": sid})
+                     "状态": score_state(o),
+                     "答题卡": ("已传" if row_val(o, "sheet", "") and str(row_val(o, "sheet", "")).strip() else "—"),
+                     "_sid": sid})
     df = pd.DataFrame(rows).set_index("_sid")
     st.subheader("录入成绩")
     st.caption(f"名单范围：学校「{scope_school}」· 年级「{scope_grade}」· 共 {len(df)} 人。"
                "未录入 = 还没录（不是 0 分）；已录入 = 填了分数；缺考 = 确认没参加。")
     ed = st.data_editor(
         df, hide_index=True, use_container_width=True, key=f"entry{eid}",
-        disabled=["学生", "教学类型", "班级"],
+        disabled=["学生", "教学类型", "班级", "答题卡"],
         column_config={
             "成绩": st.column_config.NumberColumn(min_value=0.0, max_value=full, step=0.5, help=f"满分 {full:g}"),
             "状态": st.column_config.SelectboxColumn(options=["未录入", "已录入", "缺考"]),
@@ -1323,7 +1333,7 @@ def tab_entry():
         msg = f"已录入 {saved} 人，缺考 {absent} 人，清空 {cleared} 人"
         if skipped:
             msg += f"；{skipped} 人状态是「已录入」但没填分数，已跳过"
-        st.success(msg)
+        st.session_state["entry_msg"] = msg + "（只保存了分数和状态；试卷分析请在下面单个学生里保存）"
         st.rerun()
 
     st.divider()
@@ -1356,7 +1366,17 @@ def tab_entry():
         else:
             st.caption("这场考试还没传共用试卷 —— 到「考试成绩 → 考试管理」里传一次就行。")
         paper = st.file_uploader("这个学生单独的试卷(一般不用传)", type=["jpg", "jpeg", "png", "pdf"], accept_multiple_files=True, key=f"p{sid}{eid}")
+        cur_stu_paper = str(row_val(o, "paper", "") or "").strip()
+        if cur_stu_paper:
+            st.caption(f"✅ 这个学生单独传过试卷：{file_count(cur_stu_paper)} 个文件")
+            show_photos(cur_stu_paper, "该学生单独的试卷")
         sheet = st.file_uploader("答题卡照片/PDF(可多张)", type=["jpg", "jpeg", "png", "pdf"], accept_multiple_files=True, key=f"s{sid}{eid}")
+        cur_sheet = str(row_val(o, "sheet", "") or "").strip()
+        if cur_sheet:
+            st.caption(f"✅ 已保存答题卡 {file_count(cur_sheet)} 个文件（下面就是已上传的，可点开看/下载）")
+            show_photos(cur_sheet, "已上传的答题卡")
+        else:
+            st.caption("这个学生还没有答题卡。选好文件后，记得点下面的保存按钮。")
         note = st.text_area("试卷分析 / 备注（学生也能看到，可整段粘贴）",
                             row_val(o, "note", "") if o is not None else "", height=150,
                             key=f"nt{sid}{eid}")
@@ -1375,7 +1395,13 @@ def tab_entry():
                        paper=CASE WHEN ?='' THEN paper ELSE ? END, sheet=CASE WHEN ?='' THEN sheet ELSE ? END
                        WHERE id=?""",
                     (score, wrong, reasons_joined, knowledge, note, p, p, s, s, int(o["id"])))
-            st.success("已保存 ✅ 学生登录后刷新就能看到这份分析")
+            _stu_name = str(stu[stu["id"] == int(sid)]["name"].iloc[0])
+            _got = ["分数", "错题", "分析"]
+            if p:
+                _got.append("试卷")
+            if s:
+                _got.append("答题卡")
+            st.session_state["entry_msg"] = f"已保存 ✅「{_stu_name}」的" + "、".join(_got) + "都存好了；学生登录后刷新就能看到。"
             st.rerun()
 
 
