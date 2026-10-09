@@ -19,7 +19,7 @@ import user_management as um
 PASSWORD = os.environ.get("SCORE_TRACKER_PASSWORD", "")
 DAY_START, DAY_END = "08:00", "20:30"   # 课程表/空闲时间统计的工作时段
 SUBJECTS = ["数学", "物理", "其他"]
-REASONS = ["计算错误", "概念不清", "审题失误", "方法不会", "没时间", "粗心抄错", "其他"]
+REASONS = ["计算错误", "概念不清", "审题失误", "方法不会", "没时间", "粗心抄错", "其他", "自定义"]
 WD = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
 BASE = Path(__file__).parent
@@ -1073,6 +1073,160 @@ def save_entry_changes(eid, changes, old_map):
     return saved, absent, cleared, skipped
 
 
+AI_PROMPT = """请从这张答题卡里提取下面三项，严格按这个格式输出，不要多余的话：
+错题：5,12,18
+错因：计算错误,方法不会
+知识点：二次函数、判别式
+说明：错因优先从这些里选 —— 计算错误、概念不清、审题失误、方法不会、没时间、粗心抄错、其他；确实不在这几个里的，就照你自己的说法写。"""
+
+# 错因的常见说法 -> 标准标签（AI 用自己的话写也能归位）
+REASON_HINTS = {
+    "计算错误": ["计算", "算错", "运算", "算理", "口算"],
+    "概念不清": ["概念", "定义", "性质", "基础不牢", "理解不透", "知识点不清"],
+    "审题失误": ["审题", "读题", "看错题", "题意", "漏看条件", "看错条件"],
+    "方法不会": ["方法", "不会", "思路", "步骤", "无从下手", "没思路", "解题思路"],
+    "没时间": ["没时间", "时间不够", "来不及", "没做完", "时间紧"],
+    "粗心抄错": ["粗心", "抄错", "笔误", "马虎", "看错数字", "看错符号", "符号错误"],
+    "其他": ["其他", "其它", "综合"],
+}
+
+_AI_FIELDS = [
+    ("wrong", r"(错题题号|错题号|错题|题号|错的题)"),
+    ("reasons", r"(错因|错误原因|失分原因|原因)"),
+    ("knowledge", r"(涉及知识点|薄弱知识点|知识点|考点)"),
+    ("score", r"(得分|分数|成绩)"),
+]
+
+
+def _norm_text(t) -> str:
+    """把全角标点、markdown 符号统一掉，方便机器识别。"""
+    t = str(t or "")
+    for a, b in (("：", ":"), ("，", ","), ("、", ","), ("；", ";"), ("．", "."),
+                 ("（", "("), ("）", ")"), ("～", "-"), ("—", "-"), ("　", " ")):
+        t = t.replace(a, b)
+    for ch in ("*", "#", "|", "`", ">", "[", "]", "**"):
+        t = t.replace(ch, " ")
+    return t
+
+
+def _nums(text) -> str:
+    """抽题号：支持 5,12 / 5-8 / 第5题 / 12、18 等写法。"""
+    out, seen = [], set()
+    for part in re.findall(r"\d+\s*(?:[-~至]\s*\d+)?", str(text or "")):
+        if re.search(r"[-~至]", part):
+            a, b = re.split(r"[-~至]", part)
+            try:
+                a, b = int(a), int(b)
+            except Exception:
+                continue
+            if 0 < a <= b <= 200:
+                out.extend(range(a, b + 1))
+        else:
+            try:
+                out.append(int(part))
+            except Exception:
+                pass
+    res = []
+    for n in out:
+        if 0 < n <= 200 and n not in seen:
+            seen.add(n)
+            res.append(n)
+    return ",".join(str(n) for n in res)
+
+
+def parse_ai_answer(text) -> dict:
+    """把 AI 的回答整段解析成 错题/错因/知识点/得分（快递分拣）。"""
+    res = {"wrong": "", "reasons": [], "custom": "", "knowledge": "", "score": None}
+    t = _norm_text(text)
+    lines = [l.strip(" -\t") for l in t.splitlines() if l.strip()]
+    fields, used = {}, set()
+    for idx, line in enumerate(lines):
+        m = re.match(r"^([^:]{1,16}):\s*(.+)$", line)
+        if not m:
+            m = re.match(r"^(错题题号|错题号|错题|题号|错的题|错因|错误原因|失分原因|原因|涉及知识点|薄弱知识点|知识点|考点|得分|分数|成绩)\s+(.+)$", line)
+        if not m:
+            continue
+        key_raw, val = m.group(1).strip(), m.group(2).strip()
+        for key, pat in _AI_FIELDS:
+            if re.search(pat, key_raw):
+                if key not in fields:
+                    fields[key] = val
+                    used.add(idx)
+                break
+    # 兜底：没写"错题"标签时，找包含 2 个以上数字、或带"题"字的那一行
+    if "wrong" not in fields:
+        for idx, line in enumerate(lines):
+            if idx in used:
+                continue
+            n = re.findall(r"\d+", line)
+            if len(n) >= 2 or ("题" in line and n):
+                fields["wrong"] = line
+                used.add(idx)
+                break
+    res["wrong"] = _nums(fields.get("wrong", ""))
+    res["knowledge"] = str(fields.get("knowledge", "")).strip().replace(",", "、")
+    sc = re.search(r"\d+(?:\.\d+)?", str(fields.get("score", "")))
+    if sc:
+        try:
+            res["score"] = float(sc.group(0))
+        except Exception:
+            res["score"] = None
+    # 错因：先归类，认不出来的原样放进"自定义错因"
+    raw_reasons = str(fields.get("reasons", "")).strip()
+    if not raw_reasons:
+        for line in lines:
+            if any(h in line for hints in REASON_HINTS.values() for h in hints):
+                raw_reasons = line
+                break
+    matched, custom = [], []
+    for chunk in [c.strip() for c in re.split(r"[,;/]|以及|和|及", raw_reasons) if c.strip()]:
+        best, best_len = None, 0
+        for name, hints in REASON_HINTS.items():
+            for h in hints:
+                if h in chunk and len(h) > best_len:
+                    best, best_len = name, len(h)
+        if best:
+            if best not in matched:
+                matched.append(best)
+        elif chunk not in custom:
+            custom.append(chunk)
+    res["reasons"] = [r for r in REASONS if r in matched]
+    drop = {"无", "没有", "暂无", "无错因", "无明显错因", "-", "none", "None", "N/A", "n/a"}
+    res["custom"] = ",".join([c for c in custom if c not in drop])
+    return res
+
+
+def ai_paste_box(sid: int, eid: int) -> None:
+    """单个学生录分时的"智能粘贴"：把 AI 的回答整段贴进来，自动填到下面。"""
+    st.markdown("##### 🤖 智能粘贴（把 AI 的回答整段贴进来）")
+    st.caption("第一步：复制下面的提示词，连答题卡照片一起发给 GPT。")
+    st.code(AI_PROMPT, language=None)
+    st.caption("第二步：把 GPT 的回答整段粘贴到这里，点「识别并填充」。")
+    blob = st.text_area("粘贴 AI 的回答", key=f"ai{sid}{eid}", height=110,
+                        placeholder="错题：5,12,18\n错因：计算错误,方法不会\n知识点：二次函数、判别式")
+    if st.button("🔎 识别并填充到下面", key=f"aifill{sid}{eid}"):
+        r = parse_ai_answer(blob)
+        got = []
+        if r["wrong"]:
+            st.session_state[f"w{sid}{eid}"] = r["wrong"]
+            got.append(f"错题 {r['wrong']}")
+        if r["reasons"] or r["custom"]:
+            st.session_state[f"r{sid}{eid}"] = r["reasons"]
+            st.session_state[f"c{sid}{eid}"] = r["custom"]
+            got.append("错因 " + ",".join(list(r["reasons"]) + ([r["custom"]] if r["custom"] else [])))
+        if r["knowledge"]:
+            st.session_state[f"k{sid}{eid}"] = r["knowledge"]
+            got.append("知识点 " + r["knowledge"])
+        if r["score"] is not None:
+            st.session_state[f"sc{sid}{eid}"] = float(r["score"])
+            got.append(f"得分 {r['score']:g}")
+        if got:
+            st.success("已识别并填到下面：" + "；".join(got) + "（还能手动改）")
+        else:
+            st.warning("没识别出内容，看看粘贴的格式，或直接在下面手填。")
+    st.divider()
+
+
 def tab_entry():
     ex = pick_exam("in_exam")
     if ex is None:
@@ -1131,12 +1285,15 @@ def tab_entry():
                            key=f"detail{eid}")
         old = query("SELECT * FROM scores WHERE student_id=? AND exam_id=?", (int(sid), eid))
         o = old.iloc[0] if len(old) else None
+        ai_paste_box(int(sid), eid)
         cur_score = float(row_val(o, "score", 0.0)) if (o is not None and pd.notna(row_val(o, "score", None))) else 0.0
         score = st.number_input(f"得分(满分 {full:g})", 0.0, full, cur_score, 0.5, key=f"sc{sid}{eid}")
         wrong = st.text_input("错题题号(如 5,12,18)", row_val(o, "wrong_qs", "") if o is not None else "", key=f"w{sid}{eid}")
-        reasons = st.multiselect("错因", REASONS,
-                                 [x for x in (str(row_val(o, "reasons", "")).split(",") if o is not None else []) if x in REASONS],
-                                 key=f"r{sid}{eid}")
+        old_rs = [x.strip() for x in str(row_val(o, "reasons", "")).split(",") if x.strip()] if o is not None else []
+        sel_rs = [x for x in old_rs if x in REASONS]
+        custom_def = ",".join([x for x in old_rs if x not in REASONS])
+        reasons = st.multiselect("错因", REASONS, sel_rs, key=f"r{sid}{eid}")
+        custom = st.text_input("自定义错因(可选，多个用逗号分隔)", custom_def, key=f"c{sid}{eid}")
         knowledge = st.text_input("涉及知识点", row_val(o, "knowledge", "") if o is not None else "", key=f"k{sid}{eid}")
         paper = st.file_uploader("试卷照片/PDF(可多张)", type=["jpg", "jpeg", "png", "pdf"], accept_multiple_files=True, key=f"p{sid}{eid}")
         sheet = st.file_uploader("答题卡照片/PDF(可多张)", type=["jpg", "jpeg", "png", "pdf"], accept_multiple_files=True, key=f"s{sid}{eid}")
@@ -1144,15 +1301,17 @@ def tab_entry():
         if st.button("保存这个学生的详细记录", key=f"dsc{sid}{eid}"):
             tag = f"e{eid}_s{sid}"
             p, s = save_photos(paper, tag + "_paper"), save_photos(sheet, tag + "_sheet")
+            rs = list(reasons) + [x.strip() for x in str(custom or "").split(",") if x.strip()]
+            reasons_joined = ",".join(rs)
             if o is None:
                 run("""INSERT INTO scores(student_id, exam_id, score, status, wrong_qs, reasons, knowledge, paper, sheet, note)
                        VALUES(?,?,?,'已录入',?,?,?,?,?,?)""",
-                    (int(sid), eid, score, wrong, ",".join(reasons), knowledge, p, s, note))
+                    (int(sid), eid, score, wrong, reasons_joined, knowledge, p, s, note))
             else:
                 run("""UPDATE scores SET score=?, status='已录入', wrong_qs=?, reasons=?, knowledge=?, note=?,
                        paper=CASE WHEN ?='' THEN paper ELSE ? END, sheet=CASE WHEN ?='' THEN sheet ELSE ? END
                        WHERE id=?""",
-                    (score, wrong, ",".join(reasons), knowledge, note, p, p, s, s, int(o["id"])))
+                    (score, wrong, reasons_joined, knowledge, note, p, p, s, s, int(o["id"])))
             st.success("已保存")
             st.rerun()
 
