@@ -1314,7 +1314,8 @@ def tab_entry():
             "状态": st.column_config.SelectboxColumn(options=["未录入", "已录入", "缺考"]),
         },
     )
-    if st.button("💾 保存成绩", type="primary", key=f"save{eid}"):
+    st.caption("这个按钮只保存分数和状态；试卷分析、错题、知识点在下面的「单个学生详细录入」里单独保存。")
+    if st.button("💾 保存成绩（仅分数/状态）", type="primary", key=f"save{eid}"):
         changes = [{"sid": int(sid), "status": str(r["状态"] or "未录入").strip(),
                     "score": (None if pd.isna(r["成绩"]) else float(r["成绩"]))}
                    for sid, r in ed.iterrows()]
@@ -1359,7 +1360,8 @@ def tab_entry():
         note = st.text_area("试卷分析 / 备注（学生也能看到，可整段粘贴）",
                             row_val(o, "note", "") if o is not None else "", height=150,
                             key=f"nt{sid}{eid}")
-        if st.button("保存这个学生的详细记录", key=f"dsc{sid}{eid}"):
+        st.caption("⚠️ 改完（尤其是试卷分析）要点下面的按钮保存。上面那个「保存成绩」只保存分数和状态。")
+        if st.button("💾 保存这个学生（分数 / 错题 / 分析）", type="primary", key=f"dsc{sid}{eid}"):
             tag = f"e{eid}_s{sid}"
             p, s = save_photos(paper, tag + "_paper"), save_photos(sheet, tag + "_sheet")
             rs = list(reasons) + [x.strip() for x in str(custom or "").split(",") if x.strip()]
@@ -1373,7 +1375,7 @@ def tab_entry():
                        paper=CASE WHEN ?='' THEN paper ELSE ? END, sheet=CASE WHEN ?='' THEN sheet ELSE ? END
                        WHERE id=?""",
                     (score, wrong, reasons_joined, knowledge, note, p, p, s, s, int(o["id"])))
-            st.success("已保存")
+            st.success("已保存 ✅ 学生登录后刷新就能看到这份分析")
             st.rerun()
 
 
