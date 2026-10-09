@@ -1073,13 +1073,13 @@ def save_entry_changes(eid, changes, old_map):
     return saved, absent, cleared, skipped
 
 
-AI_PROMPT = """请从这张答题卡里提取下面三项，严格按这个格式输出，不要多余的话：
+FILL_TEMPLATE = """请对照答题卡，按下面这个格式回我三项，不要多余的话：
 错题：5,12,18
 错因：计算错误,方法不会
 知识点：二次函数、判别式
 说明：错因优先从这些里选 —— 计算错误、概念不清、审题失误、方法不会、没时间、粗心抄错、其他；确实不在这几个里的，就照你自己的说法写。"""
 
-# 错因的常见说法 -> 标准标签（AI 用自己的话写也能归位）
+# 错因的常见说法 -> 标准标签（换种说法写也能归位）
 REASON_HINTS = {
     "计算错误": ["计算", "算错", "运算", "算理", "口算"],
     "概念不清": ["概念", "定义", "性质", "基础不牢", "理解不透", "知识点不清"],
@@ -1090,7 +1090,7 @@ REASON_HINTS = {
     "其他": ["其他", "其它", "综合"],
 }
 
-_AI_FIELDS = [
+_FILL_FIELDS = [
     ("wrong", r"(错题题号|错题号|错题|题号|错的题)"),
     ("reasons", r"(错因|错误原因|失分原因|原因)"),
     ("knowledge", r"(涉及知识点|薄弱知识点|知识点|考点)"),
@@ -1134,8 +1134,8 @@ def _nums(text) -> str:
     return ",".join(str(n) for n in res)
 
 
-def parse_ai_answer(text) -> dict:
-    """把 AI 的回答整段解析成 错题/错因/知识点/得分（快递分拣）。"""
+def parse_fill_text(text) -> dict:
+    """把一整段文字解析成 错题/错因/知识点/得分。"""
     res = {"wrong": "", "reasons": [], "custom": "", "knowledge": "", "score": None}
     t = _norm_text(text)
     lines = [l.strip(" -\t") for l in t.splitlines() if l.strip()]
@@ -1147,7 +1147,7 @@ def parse_ai_answer(text) -> dict:
         if not m:
             continue
         key_raw, val = m.group(1).strip(), m.group(2).strip()
-        for key, pat in _AI_FIELDS:
+        for key, pat in _FILL_FIELDS:
             if re.search(pat, key_raw):
                 if key not in fields:
                     fields[key] = val
@@ -1196,16 +1196,16 @@ def parse_ai_answer(text) -> dict:
     return res
 
 
-def ai_paste_box(sid: int, eid: int) -> None:
-    """单个学生录分时的"智能粘贴"：把 AI 的回答整段贴进来，自动填到下面。"""
-    st.markdown("##### 🤖 智能粘贴（把 AI 的回答整段贴进来）")
-    st.caption("第一步：复制下面的提示词，连答题卡照片一起发给 GPT。")
-    st.code(AI_PROMPT, language=None)
-    st.caption("第二步：把 GPT 的回答整段粘贴到这里，点「识别并填充」。")
-    blob = st.text_area("粘贴 AI 的回答", key=f"ai{sid}{eid}", height=110,
+def quick_fill_box(sid: int, eid: int) -> None:
+    """单个学生录分时的快速填写：把整段文字贴进来，自动填到下面。"""
+    st.markdown("##### 📋 快速填写（把文字整段粘贴进来，自动填到下面）")
+    st.caption("第一步：复制下面这段格式说明。")
+    st.code(FILL_TEMPLATE, language=None)
+    st.caption("第二步：把内容整段粘贴到这里，点「识别并填充」。支持「错题：5,12」「第5题」「8-10题」等写法。")
+    blob = st.text_area("粘贴内容", key=f"fill{sid}{eid}", height=110,
                         placeholder="错题：5,12,18\n错因：计算错误,方法不会\n知识点：二次函数、判别式")
-    if st.button("🔎 识别并填充到下面", key=f"aifill{sid}{eid}"):
-        r = parse_ai_answer(blob)
+    if st.button("🔎 识别并填充到下面", key=f"fillbtn{sid}{eid}"):
+        r = parse_fill_text(blob)
         got = []
         if r["wrong"]:
             st.session_state[f"w{sid}{eid}"] = r["wrong"]
@@ -1285,7 +1285,7 @@ def tab_entry():
                            key=f"detail{eid}")
         old = query("SELECT * FROM scores WHERE student_id=? AND exam_id=?", (int(sid), eid))
         o = old.iloc[0] if len(old) else None
-        ai_paste_box(int(sid), eid)
+        quick_fill_box(int(sid), eid)
         cur_score = float(row_val(o, "score", 0.0)) if (o is not None and pd.notna(row_val(o, "score", None))) else 0.0
         score = st.number_input(f"得分(满分 {full:g})", 0.0, full, cur_score, 0.5, key=f"sc{sid}{eid}")
         wrong = st.text_input("错题题号(如 5,12,18)", row_val(o, "wrong_qs", "") if o is not None else "", key=f"w{sid}{eid}")
