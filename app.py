@@ -155,7 +155,8 @@ ADD_COLS = {
                  "status": "TEXT DEFAULT '在读'", "note": "TEXT DEFAULT ''",
                  "school": "TEXT DEFAULT ''"},
     "exams": {"class_id": "INTEGER", "category": "TEXT DEFAULT ''",
-              "school": "TEXT DEFAULT ''", "grade": "TEXT DEFAULT ''"},
+              "school": "TEXT DEFAULT ''", "grade": "TEXT DEFAULT ''",
+              "paper": "TEXT DEFAULT ''"},
     "classes": {"kind": "TEXT DEFAULT '班课'"},
     "lessons": {"plan_id": "INTEGER"},
     "scores": {"status": "TEXT DEFAULT ''"},
@@ -244,6 +245,26 @@ def init_db():
         detail = "; ".join(f"{nm}: 保留#{keep} 合并{drop}" for nm, keep, drop in merged)
         conn.execute("INSERT INTO app_migrations(name, applied_at, detail) VALUES(?,?,?)",
                      ("merge_dup_students_v1", datetime.now().isoformat(timespec="seconds"), detail))
+    # 一次性迁移：以前每个学生各传一份试卷 -> 把该场考试里出现最多的那份提升为"考试级共用试卷"
+    if not conn.execute("SELECT 1 FROM app_migrations WHERE name='exam_paper_share_v1'").fetchone():
+        rows = conn.execute(
+            """SELECT exam_id, paper, COUNT(*) n FROM scores
+               WHERE COALESCE(paper,'')<>'' AND exam_id IS NOT NULL
+               GROUP BY exam_id, paper ORDER BY exam_id, n DESC, paper"""
+        ).fetchall()
+        chosen = {}
+        for exam_id, paper, n in rows:
+            if exam_id not in chosen:
+                chosen[exam_id] = paper
+        promoted = 0
+        for exam_id, paper in chosen.items():
+            cur = conn.execute("SELECT COALESCE(paper,'') FROM exams WHERE id=?", (exam_id,)).fetchone()
+            if cur is not None and not str(cur[0] or "").strip():
+                conn.execute("UPDATE exams SET paper=? WHERE id=?", (paper, exam_id))
+                promoted += 1
+        conn.execute("INSERT INTO app_migrations(name, applied_at, detail) VALUES(?,?,?)",
+                     ("exam_paper_share_v1", datetime.now().isoformat(timespec="seconds"),
+                      f"把 {promoted} 场考试的学生试卷提升为共用试卷"))
     conn.commit()
     conn.close()
     cloud_store.save_database(DB)
@@ -1098,6 +1119,27 @@ _FILL_FIELDS = [
 ]
 
 
+def _extract_note(raw) -> str:
+    """把"分析/点评/备注"标签后面那一整段（可跨多行）原样取出来。"""
+    lines = [str(x).rstrip() for x in str(raw or "").splitlines()]
+    start = None
+    for i, line in enumerate(lines):
+        head = line.strip().split(":")[0].split("：")[0][:10]
+        if re.search(r"(试卷分析|整体分析|分析|点评|备注|总结|讲评)", head):
+            start = i
+            break
+    if start is None:
+        return ""
+    m = re.match(r"^\s*[^:：]{0,12}[:：]\s*(.*)$", lines[start])
+    buf = [m.group(1) if m else lines[start]]
+    for line in lines[start + 1:]:
+        head = line.strip().split(":")[0].split("：")[0].strip()
+        if re.fullmatch(r"(错题题号|错题号|错题|题号|错因|错误原因|失分原因|知识点|考点|得分|分数|成绩)", head):
+            break
+        buf.append(line)
+    return "\n".join([x.strip() for x in buf if x.strip()]).strip()
+
+
 def _norm_text(t) -> str:
     """把全角标点、markdown 符号统一掉，方便机器识别。"""
     t = str(t or "")
@@ -1136,7 +1178,8 @@ def _nums(text) -> str:
 
 def parse_fill_text(text) -> dict:
     """把一整段文字解析成 错题/错因/知识点/得分。"""
-    res = {"wrong": "", "reasons": [], "custom": "", "knowledge": "", "score": None}
+    res = {"wrong": "", "reasons": [], "custom": "", "knowledge": "", "score": None, "note": ""}
+    res["note"] = _extract_note(text)
     t = _norm_text(text)
     lines = [l.strip(" -\t") for l in t.splitlines() if l.strip()]
     fields, used = {}, set()
@@ -1220,6 +1263,9 @@ def quick_fill_box(sid: int, eid: int) -> None:
         if r["score"] is not None:
             st.session_state[f"sc{sid}{eid}"] = float(r["score"])
             got.append(f"得分 {r['score']:g}")
+        if r.get("note"):
+            st.session_state[f"nt{sid}{eid}"] = r["note"]
+            got.append("试卷分析")
         if got:
             st.success("已识别并填到下面：" + "；".join(got) + "（还能手动改）")
         else:
@@ -1292,12 +1338,27 @@ def tab_entry():
         old_rs = [x.strip() for x in str(row_val(o, "reasons", "")).split(",") if x.strip()] if o is not None else []
         sel_rs = [x for x in old_rs if x in REASONS]
         custom_def = ",".join([x for x in old_rs if x not in REASONS])
-        reasons = st.multiselect("错因", REASONS, sel_rs, key=f"r{sid}{eid}")
-        custom = st.text_input("自定义错因(可选，多个用逗号分隔)", custom_def, key=f"c{sid}{eid}")
+        rkey, ckey = f"r{sid}{eid}", f"c{sid}{eid}"
+        if rkey in st.session_state:
+            reasons = st.multiselect("错因", REASONS, key=rkey)
+        else:
+            reasons = st.multiselect("错因", REASONS, sel_rs, key=rkey)
+        if ckey in st.session_state:
+            custom = st.text_input("自定义错因(可选，多个用逗号分隔)", key=ckey)
+        else:
+            custom = st.text_input("自定义错因(可选，多个用逗号分隔)", custom_def, key=ckey)
         knowledge = st.text_input("涉及知识点", row_val(o, "knowledge", "") if o is not None else "", key=f"k{sid}{eid}")
-        paper = st.file_uploader("试卷照片/PDF(可多张)", type=["jpg", "jpeg", "png", "pdf"], accept_multiple_files=True, key=f"p{sid}{eid}")
+        st.markdown("**这场考试的试卷（所有人共用）**")
+        exam_paper = str(row_val(ex, "paper", "") or "").strip()
+        if exam_paper:
+            show_photos(exam_paper, "考试试卷")
+        else:
+            st.caption("这场考试还没传共用试卷 —— 到「考试成绩 → 考试管理」里传一次就行。")
+        paper = st.file_uploader("这个学生单独的试卷(一般不用传)", type=["jpg", "jpeg", "png", "pdf"], accept_multiple_files=True, key=f"p{sid}{eid}")
         sheet = st.file_uploader("答题卡照片/PDF(可多张)", type=["jpg", "jpeg", "png", "pdf"], accept_multiple_files=True, key=f"s{sid}{eid}")
-        note = st.text_input("备注", row_val(o, "note", "") if o is not None else "", key=f"n{sid}{eid}")
+        note = st.text_area("试卷分析 / 备注（学生也能看到，可整段粘贴）",
+                            row_val(o, "note", "") if o is not None else "", height=150,
+                            key=f"nt{sid}{eid}")
         if st.button("保存这个学生的详细记录", key=f"dsc{sid}{eid}"):
             tag = f"e{eid}_s{sid}"
             p, s = save_photos(paper, tag + "_paper"), save_photos(sheet, tag + "_sheet")
@@ -1435,17 +1496,23 @@ def tab_manage():
         f = c5.number_input("满分", 1.0, 300.0, 100.0, 5.0)
         c = st.selectbox("所属班级(可不选)", [0] + cls_ids,
                          format_func=lambda i: "不限班级" if i == 0 else cls_map.get(i, str(i)))
+        paper_new = st.file_uploader("试卷照片/PDF（这场考试共用，传一次就行，可留空）",
+                                     type=["jpg", "jpeg", "png", "pdf"], accept_multiple_files=True)
         st.caption("填了学校和年级后，录分名单=该学校该年级的全部学生（班课 + 一对一都会进来）。")
         if st.form_submit_button("添加考试", type="primary") and n.strip():
-            run("""INSERT INTO exams(name, exam_date, subject, full_score, class_id, category, school, grade)
-                   VALUES(?,?,?,?,?,?,?,?)""",
-                (n.strip(), str(d), s, f, c or None, cat, school.strip(), grade.strip()))
+            new_eid = run("""INSERT INTO exams(name, exam_date, subject, full_score, class_id, category, school, grade)
+                             VALUES(?,?,?,?,?,?,?,?)""",
+                          (n.strip(), str(d), s, f, c or None, cat, school.strip(), grade.strip()))
+            if paper_new:
+                names = save_photos(paper_new, f"e{int(new_eid)}_exampaper")
+                run("UPDATE exams SET paper=? WHERE id=?", (names, int(new_eid)))
             st.session_state["exam_msg"] = f"已添加考试「{n.strip()}」"
             st.rerun()
 
     # ---------- 列表 + 筛选 ----------
     all_ex = query("""SELECT e.id, e.exam_date, e.name, e.subject, COALESCE(e.category,'') category,
                              e.full_score, COALESCE(e.school,'') school, COALESCE(e.grade,'') grade,
+                             CASE WHEN COALESCE(e.paper,'')<>'' THEN '有' ELSE '—' END AS 试卷,
                              COALESCE(c.name,'') cname
                       FROM exams e LEFT JOIN classes c ON c.id=e.class_id
                       ORDER BY e.exam_date DESC, e.id DESC""")
@@ -1465,7 +1532,7 @@ def tab_manage():
     show = view.copy()
     show["分类"] = show["category"].replace("", "未分类")
     st.dataframe(
-        show[["exam_date", "name", "school", "grade", "subject", "分类", "full_score", "cname"]].rename(
+        show[["exam_date", "name", "school", "grade", "subject", "分类", "full_score", "试卷", "cname"]].rename(
             columns={"exam_date": "日期", "name": "考试", "school": "学校", "grade": "年级",
                      "subject": "科目", "full_score": "满分", "cname": "班级"}),
         hide_index=True, use_container_width=True,
@@ -1487,6 +1554,12 @@ def tab_manage():
     cur_cls = int(ex["class_id"]) if pd.notna(ex["class_id"]) else 0
     cur_subj = str(ex["subject"] or "")
     subj_opts = SUBJECTS if cur_subj in SUBJECTS else SUBJECTS + [cur_subj]
+    cur_paper = str(row_val(ex, "paper", "") or "").strip()
+    st.markdown("**这场考试的试卷（所有学生共用，传一次就行）**")
+    if cur_paper:
+        show_photos(cur_paper, "共用试卷")
+    else:
+        st.caption("还没上传共用试卷。上传后，这个学校/年级的学生在自己账号里就能看到这张卷子。")
     with st.form(f"edit_exam_{pick}"):
         c1, c2, c3 = st.columns(3)
         n2 = c1.text_input("考试名称", str(ex["name"]))
@@ -1503,12 +1576,21 @@ def tab_manage():
         f2v = c5.number_input("满分", 1.0, 300.0, float(ex["full_score"] or 100), 5.0)
         c2v = st.selectbox("所属班级", cls_opts, index=cls_opts.index(cur_cls) if cur_cls in cls_opts else 0,
                            format_func=lambda i: "不限班级" if i == 0 else cls_map.get(i, str(i)))
-        b1, b2 = st.columns(2)
+        paper_add = st.file_uploader("追加试卷照片/PDF（可多张）", type=["jpg", "jpeg", "png", "pdf"],
+                                     accept_multiple_files=True, key=f"exam_paper_{pick}")
+        b1, b4, b2 = st.columns(3)
         if b1.form_submit_button("💾 保存修改", type="primary"):
             run("""UPDATE exams SET name=?, exam_date=?, subject=?, full_score=?, class_id=?, category=?, school=?, grade=?
                    WHERE id=?""",
                 (n2.strip(), str(d2), s2, f2v, c2v or None, cat2, school2.strip(), grade2.strip(), int(pick)))
+            if paper_add:
+                added = save_photos(paper_add, f"e{int(pick)}_exampaper")
+                run("UPDATE exams SET paper=? WHERE id=?", ((cur_paper + "|" + added).strip("|"), int(pick)))
             st.session_state["exam_msg"] = f"考试「{n2.strip()}」已保存"
+            st.rerun()
+        if b4.form_submit_button("🗑 清空共用试卷"):
+            run("UPDATE exams SET paper='' WHERE id=?", (int(pick),))
+            st.session_state["exam_msg"] = f"已清空「{ex['name']}」的共用试卷"
             st.rerun()
         if b2.form_submit_button("🗑 删除这场考试"):
             cnt = int(query("SELECT COUNT(*) n FROM scores WHERE exam_id=?", (int(pick),)).n[0])

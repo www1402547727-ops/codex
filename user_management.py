@@ -63,6 +63,32 @@ def query(sql: str, params=()) -> pd.DataFrame:
         conn.close()
 
 
+def _photos_dir() -> Path:
+    try:
+        return Path(DB_PATH).parent / "photos"
+    except Exception:
+        return Path("data") / "photos"
+
+
+def _show_media(joined, caption: str = "") -> None:
+    """显示试卷 / 答题卡：图片直接显示（自动适配手机宽度），PDF 给下载按钮。"""
+    names = [x for x in str(joined or "").split("|") if x.strip()]
+    for n in names:
+        try:
+            path = cloud_store.ensure_local_photo(n, _photos_dir())
+        except Exception:
+            continue
+        if not path.exists():
+            continue
+        if path.suffix.lower() == ".pdf":
+            st.download_button(
+                f"下载{caption}：{n}", data=path.read_bytes(), file_name=n,
+                mime="application/pdf", key=f"dl_{caption}_{n}", use_container_width=True,
+            )
+        else:
+            st.image(str(path), caption=caption, use_container_width=True)
+
+
 def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -667,7 +693,8 @@ def page_student_scores() -> None:
         st.stop()
     st.title("我的成绩")
     df = query(
-        """SELECT sc.id, sc.score, sc.wrong_qs, sc.knowledge,
+        """SELECT sc.id, sc.score, sc.wrong_qs, sc.knowledge, sc.note,
+                  sc.paper, sc.sheet, COALESCE(e.paper,'') AS exam_paper,
                   e.name AS exam_name, e.exam_date, e.subject, e.full_score
            FROM scores sc
            JOIN exams e ON e.id=sc.exam_id
@@ -706,3 +733,14 @@ def page_student_scores() -> None:
             st.write(f"**分数：** {score_text}/{full_text}")
             st.write(f"**错题：** {row['wrong_qs'] or '—'}")
             st.write(f"**薄弱知识点：** {row['knowledge'] or '—'}")
+            note = str(row.get("note") or "").strip()
+            if note:
+                st.markdown("**试卷分析**")
+                st.markdown(note)
+            paper = str(row.get("paper") or "").strip() or str(row.get("exam_paper") or "").strip()
+            if paper:
+                st.markdown("**试卷**")
+                _show_media(paper, "试卷")
+            if str(row.get("sheet") or "").strip():
+                st.markdown("**我的答题卡**")
+                _show_media(row.get("sheet"), "答题卡")
