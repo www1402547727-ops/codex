@@ -759,7 +759,8 @@ def page_stats():
 
 # ==================== 学生 ====================
 def student_report(sid):
-    df = query("""SELECT sc.*, e.name exam_name, e.exam_date, e.subject, e.full_score
+    df = query("""SELECT sc.*, e.name exam_name, e.exam_date, e.subject, e.full_score,
+                         COALESCE(e.paper,'') exam_paper
                   FROM scores sc JOIN exams e ON sc.exam_id=e.id WHERE sc.student_id=? ORDER BY e.exam_date""", (int(sid),))
     if df.empty:
         st.info("这个学生还没有考试成绩")
@@ -789,7 +790,7 @@ def student_report(sid):
             st.write(f"**知识点**:{row.knowledge or '—'}")
             if row.note:
                 st.write(f"**备注**:{row.note}")
-            show_photos(row.paper, "试卷")
+            show_photos(str(row.get("exam_paper") or "").strip() or row.paper, "试卷")
             show_photos(row.sheet, "答题卡")
 
 
@@ -1365,11 +1366,6 @@ def tab_entry():
             show_photos(exam_paper, "考试试卷")
         else:
             st.caption("这场考试还没传共用试卷 —— 到「考试成绩 → 考试管理」里传一次就行。")
-        paper = st.file_uploader("这个学生单独的试卷(一般不用传)", type=["jpg", "jpeg", "png", "pdf"], accept_multiple_files=True, key=f"p{sid}{eid}")
-        cur_stu_paper = str(row_val(o, "paper", "") or "").strip()
-        if cur_stu_paper:
-            st.caption(f"✅ 这个学生单独传过试卷：{file_count(cur_stu_paper)} 个文件")
-            show_photos(cur_stu_paper, "该学生单独的试卷")
         sheet = st.file_uploader("答题卡照片/PDF(可多张)", type=["jpg", "jpeg", "png", "pdf"], accept_multiple_files=True, key=f"s{sid}{eid}")
         cur_sheet = str(row_val(o, "sheet", "") or "").strip()
         if cur_sheet:
@@ -1383,7 +1379,7 @@ def tab_entry():
         st.caption("⚠️ 改完（尤其是试卷分析）要点下面的按钮保存。上面那个「保存成绩」只保存分数和状态。")
         if st.button("💾 保存这个学生（分数 / 错题 / 分析）", type="primary", key=f"dsc{sid}{eid}"):
             tag = f"e{eid}_s{sid}"
-            p, s = save_photos(paper, tag + "_paper"), save_photos(sheet, tag + "_sheet")
+            p, s = "", save_photos(sheet, tag + "_sheet")
             rs = list(reasons) + [x.strip() for x in str(custom or "").split(",") if x.strip()]
             reasons_joined = ",".join(rs)
             if o is None:
@@ -1397,8 +1393,6 @@ def tab_entry():
                     (score, wrong, reasons_joined, knowledge, note, p, p, s, s, int(o["id"])))
             _stu_name = str(stu[stu["id"] == int(sid)]["name"].iloc[0])
             _got = ["分数", "错题", "分析"]
-            if p:
-                _got.append("试卷")
             if s:
                 _got.append("答题卡")
             st.session_state["entry_msg"] = f"已保存 ✅「{_stu_name}」的" + "、".join(_got) + "都存好了；学生登录后刷新就能看到。"

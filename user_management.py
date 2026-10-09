@@ -737,7 +737,8 @@ def page_student_scores() -> None:
             if note:
                 st.markdown("**试卷分析**")
                 st.markdown(note)
-            paper = str(row.get("paper") or "").strip() or str(row.get("exam_paper") or "").strip()
+            # 优先显示这场考试的共用（学校）试卷；老数据没有共用试卷时才回退到个人试卷
+            paper = str(row.get("exam_paper") or "").strip() or str(row.get("paper") or "").strip()
             if paper:
                 st.markdown("**试卷**")
                 _show_media(paper, "试卷")
