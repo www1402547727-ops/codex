@@ -1094,11 +1094,11 @@ def save_entry_changes(eid, changes, old_map):
     return saved, absent, cleared, skipped
 
 
-FILL_TEMPLATE = """请对照答题卡，按下面这个格式回我三项，不要多余的话：
-错题：5,12,18
-错因：计算错误,方法不会
-知识点：二次函数、判别式
-说明：错因优先从这些里选 —— 计算错误、概念不清、审题失误、方法不会、没时间、粗心抄错、其他；确实不在这几个里的，就照你自己的说法写。"""
+FILL_TEMPLATE = """请对照答题卡，按下面的格式回我四行，不要多余的话：
+错题：（填题号，多个用逗号分隔）
+错因：（只能从这些里选：计算错误、概念不清、审题失误、方法不会、没时间、粗心抄错、其他；确实不在这几个里的，照你自己的话写）
+知识点：（填知识点，多个用顿号分隔）
+分析：（针对这张卷子写一段详细分析，可以写多行）"""
 
 # 错因的常见说法 -> 标准标签（换种说法写也能归位）
 REASON_HINTS = {
@@ -1244,7 +1244,7 @@ def quick_fill_box(sid: int, eid: int) -> None:
     st.markdown("##### 📋 快速填写（把文字整段粘贴进来，自动填到下面）")
     st.caption("第一步：复制下面这段格式说明。")
     st.code(FILL_TEMPLATE, language=None)
-    st.caption("第二步：把内容整段粘贴到这里，点「识别并填充」。支持「错题：5,12」「第5题」「8-10题」等写法。")
+    st.caption("第二步：把内容整段粘贴到这里，点「识别并填充」。")
     blob = st.text_area("粘贴内容", key=f"fill{sid}{eid}", height=110,
                         placeholder="错题：5,12,18\n错因：计算错误,方法不会\n知识点：二次函数、判别式")
     if st.button("🔎 识别并填充到下面", key=f"fillbtn{sid}{eid}"):
