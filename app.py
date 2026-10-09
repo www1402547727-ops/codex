@@ -1368,9 +1368,18 @@ def tab_entry():
             st.caption("这场考试还没传共用试卷 —— 到「考试成绩 → 考试管理」里传一次就行。")
         sheet = st.file_uploader("答题卡照片/PDF(可多张)", type=["jpg", "jpeg", "png", "pdf"], accept_multiple_files=True, key=f"s{sid}{eid}")
         cur_sheet = str(row_val(o, "sheet", "") or "").strip()
-        if cur_sheet:
-            st.caption(f"✅ 已保存答题卡 {file_count(cur_sheet)} 个文件（下面就是已上传的，可点开看/下载）")
-            show_photos(cur_sheet, "已上传的答题卡")
+        sheet_files = [x for x in cur_sheet.split("|") if x.strip()]
+        if sheet_files:
+            st.caption(f"✅ 已保存答题卡 {len(sheet_files)} 个文件；传错了可以单独删掉再传。")
+            for _idx, _fn in enumerate(sheet_files):
+                _ci, _cd = st.columns([5, 1])
+                with _ci:
+                    show_photos(_fn, f"答题卡 {_idx + 1}")
+                if _cd.button("🗑 删除", key=f"del_sheet_{sid}_{eid}_{_idx}"):
+                    _rest = [x for x in sheet_files if x != _fn]
+                    run("UPDATE scores SET sheet=? WHERE id=?", ("|".join(_rest), int(o["id"])))
+                    st.session_state["entry_msg"] = "已删除这张答题卡（可重新上传）"
+                    st.rerun()
         else:
             st.caption("这个学生还没有答题卡。选好文件后，记得点下面的保存按钮。")
         note = st.text_area("试卷分析 / 备注（学生也能看到，可整段粘贴）",
@@ -1577,9 +1586,19 @@ def tab_manage():
     cur_subj = str(ex["subject"] or "")
     subj_opts = SUBJECTS if cur_subj in SUBJECTS else SUBJECTS + [cur_subj]
     cur_paper = str(row_val(ex, "paper", "") or "").strip()
+    paper_files = [x for x in cur_paper.split("|") if x.strip()]
     st.markdown("**这场考试的试卷（所有学生共用，传一次就行）**")
-    if cur_paper:
-        show_photos(cur_paper, "共用试卷")
+    if paper_files:
+        st.caption(f"已上传 {len(paper_files)} 个文件。传错了可以单独删掉某一页，再重新上传。")
+        for _idx, _fn in enumerate(paper_files):
+            _ci, _cd = st.columns([5, 1])
+            with _ci:
+                show_photos(_fn, f"共用试卷 {_idx + 1}")
+            if _cd.button("🗑 删除", key=f"del_exam_paper_{pick}_{_idx}"):
+                _rest = [x for x in paper_files if x != _fn]
+                run("UPDATE exams SET paper=? WHERE id=?", ("|".join(_rest), int(pick)))
+                st.session_state["exam_msg"] = "已删除这张试卷文件"
+                st.rerun()
     else:
         st.caption("还没上传共用试卷。上传后，这个学校/年级的学生在自己账号里就能看到这张卷子。")
     with st.form(f"edit_exam_{pick}"):
