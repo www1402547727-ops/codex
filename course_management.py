@@ -841,6 +841,26 @@ def location_month_summary(month: str) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
+def location_detail_summary(month: str) -> pd.DataFrame:
+    """按「地点 + 授课对象」统计节数：班课按班级、一对一按学生。"""
+    return query(
+        """SELECT COALESCE(tl.name, '未填写地点') AS location_name,
+                  CASE WHEN l.target_type='一对一' THEN '一对一' ELSE '班级课' END AS kind,
+                  CASE WHEN l.target_type='一对一' THEN COALESCE(s.name, '（未指定学生）')
+                       ELSE COALESCE(c.name, '（未指定班级）') END AS target_name,
+                  COALESCE(NULLIF(l.subject, ''), NULLIF(s.subject, ''), NULLIF(c.subject, ''), '') AS subject,
+                  COUNT(*) AS lessons
+           FROM lessons l
+           LEFT JOIN teaching_locations tl ON tl.id = l.location_id
+           LEFT JOIN classes c ON c.id = l.class_id
+           LEFT JOIN one_to_one_students s ON s.id = l.student_id
+           WHERE substr(l.lesson_date, 1, 7) = ?
+           GROUP BY location_name, kind, target_name
+           ORDER BY location_name, kind, lessons DESC, target_name""",
+        (month,),
+    )
+
+
 def location_settlement_summary(month: str) -> pd.DataFrame:
     summary = location_month_summary(month)
     if summary.empty:
@@ -1817,6 +1837,27 @@ def page_stats() -> None:
         changed = display[display["结算状态"] == "结算后有变动"]
         if not changed.empty:
             st.warning("有地点在结算后发生了课程数量变化，请核对差异后重新结算。")
+
+        loc_detail = location_detail_summary(dt.strftime("%Y-%m"))
+        if not loc_detail.empty:
+            st.markdown("**📍 每个地点具体给谁上了几节**")
+            for loc_name, grp in loc_detail.groupby("location_name", sort=False):
+                st.markdown(f"**{loc_name}** — 共 {int(grp['lessons'].sum())} 节")
+                one_rows = grp[grp["kind"] == "一对一"]
+                cls_rows = grp[grp["kind"] == "班级课"]
+                if not one_rows.empty:
+                    st.caption("一对一：" + "、".join(
+                        f"{r.target_name} {int(r.lessons)} 节" for r in one_rows.itertuples()))
+                if not cls_rows.empty:
+                    st.caption("班课：" + "、".join(
+                        f"{r.target_name} {int(r.lessons)} 节" for r in cls_rows.itertuples()))
+            with st.expander("看明细表格（含科目）"):
+                st.dataframe(
+                    loc_detail.rename(columns={"location_name": "地点", "kind": "类型",
+                                               "target_name": "班级/学生", "subject": "科目",
+                                               "lessons": "节数"}),
+                    hide_index=True, use_container_width=True,
+                )
 
         manageable = display[display["location_id"] > 0]
         if not manageable.empty:
