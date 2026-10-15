@@ -23,7 +23,10 @@ import streamlit as st
 import cloud_store
 
 ROSTER_FILENAME = "teachers.json"
-DEFAULT_SLUG = cloud_store.DEFAULT_SLUG
+# 本模块自己定义，不从 cloud_store 读：
+# 一旦在模块加载阶段去读别的模块的属性，只要那边文件没更新到位就会在启动时直接崩掉。
+# 取值必须和 cloud_store.DEFAULT_SLUG 保持一致（有测试守着）。
+DEFAULT_SLUG = "default"
 DEFAULT_TEACHER_USERNAME = "teacher"
 
 _lock = threading.RLock()

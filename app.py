@@ -10,12 +10,9 @@ import streamlit as st
 import streamlit.components.v1 as components
 from PIL import Image, ImageOps
 
-import admin_console
+# 先只导入 cloud_store（它自成一体），其余业务模块放到部署自检之后再导入，
+# 这样万一云端文件只更新了一半，能给出人话提示而不是一串红色报错。
 import cloud_store
-import course_management as cm
-import teacher_registry
-import ui_theme
-import user_management as um
 
 # ==================== 配置 ====================
 PASSWORD = os.environ.get("SCORE_TRACKER_PASSWORD", "")
@@ -26,6 +23,27 @@ WD = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
 BASE = Path(__file__).parent
 st.set_page_config(page_title="教务工作台", page_icon="📒", layout="wide")
+
+# 部署自检：云端偶尔会出现「只更新了部分文件」的情况，新旧代码混在一起会直接崩。
+# 这里主动检查依赖的接口是否齐全，给一句人话提示，而不是一串红色报错。
+_MISSING_API = [
+    name
+    for name in ("DEFAULT_SLUG", "db_object_path", "get_data_dir", "set_session_slug", "prepare_database")
+    if not hasattr(cloud_store, name)
+]
+if _MISSING_API:
+    st.error(
+        "代码没有更新完整（cloud_store 里缺少：" + "、".join(_MISSING_API) + "）。"
+        "请点页面右下角 Manage app → Reboot app 重新启动一次即可。"
+    )
+    st.stop()
+
+import admin_console
+import course_management as cm
+import teacher_registry
+import ui_theme
+import user_management as um
+
 cloud_store.configure_from_streamlit()
 teacher_registry.configure(BASE / "data")
 
