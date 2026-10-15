@@ -1791,6 +1791,12 @@ if user["role"] == um.ROLE_TEACHER:
     if IS_ADMIN:
         PAGES["账号管理"] = um.page_user_admin
         PAGES["总后台"] = admin_console.page_admin
+    elif teacher_registry.get_setting(
+        teacher_registry.SETTING_TEACHERS_CAN_CREATE_STUDENTS, False
+    ):
+        # 总后台把开关打开了：老师可以给自己的学生开账号、重置密码，
+        # 但没有删除入口（删除不可逆，留给总管理员）
+        PAGES["账号管理"] = lambda: um.page_user_admin(allow_delete=False)
     PAGES["账号"] = um.page_account
 else:
     PAGES = {

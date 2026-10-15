@@ -54,7 +54,7 @@ def roster_path() -> Path:
 
 
 def _empty_roster() -> dict:
-    return {"version": 1, "teachers": [], "usernames": {}}
+    return {"version": 1, "teachers": [], "usernames": {}, "settings": {}}
 
 
 def _normalize(roster: dict | None) -> dict:
@@ -64,7 +64,25 @@ def _normalize(roster: dict | None) -> dict:
             out["teachers"] = [t for t in roster["teachers"] if isinstance(t, dict)]
         if isinstance(roster.get("usernames"), dict):
             out["usernames"] = {str(k): str(v) for k, v in roster["usernames"].items()}
+        if isinstance(roster.get("settings"), dict):
+            out["settings"] = {str(k): v for k, v in roster["settings"].items()}
     return out
+
+
+# ==================== 全局开关 ====================
+# 允许老师给自己的学生开账号。默认关闭：老师开不了任何账号。
+SETTING_TEACHERS_CAN_CREATE_STUDENTS = "teachers_can_create_students"
+
+
+def get_setting(name: str, default=False):
+    return load().get("settings", {}).get(name, default)
+
+
+def set_setting(name: str, value) -> None:
+    with _lock:
+        roster = load()
+        roster.setdefault("settings", {})[name] = value
+        save(roster, strict=True)
 
 
 # ==================== 读写 ====================

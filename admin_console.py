@@ -305,6 +305,33 @@ def page_admin() -> None:
 
     st.divider()
 
+    # ---------- 全局开关 ----------
+    allow = bool(
+        teacher_registry.get_setting(
+            teacher_registry.SETTING_TEACHERS_CAN_CREATE_STUDENTS, False
+        )
+    )
+    new_allow = st.toggle(
+        "允许老师给自己的学生开账号",
+        value=allow,
+        key="set_allow_students",
+        help=(
+            "关闭：老师完全看不到「账号管理」，开账号只能找你。"
+            "打开：老师可以给自己的学生开账号、重置密码、停用启用，但没有删除入口。"
+        ),
+    )
+    if bool(new_allow) != allow:
+        teacher_registry.set_setting(
+            teacher_registry.SETTING_TEACHERS_CAN_CREATE_STUDENTS, bool(new_allow)
+        )
+        st.rerun()
+    st.caption(
+        "说明：老师开账号只是往他自己那份数据里加一条记录，不会拖垮网站；"
+        "真正影响访问速度的是「同时在线人数」，不是学生数量。"
+    )
+
+    st.divider()
+
     # ---------- 开通老师 ----------
     with st.expander("＋ 开通老师", expanded=len(entries) <= 1):
         st.caption("开通后把「登录账号 + 初始密码」发给他，他第一次登录会被要求改密码。")
