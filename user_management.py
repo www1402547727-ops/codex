@@ -34,8 +34,25 @@ def configure(db_path: str | Path) -> None:
     DB_PATH = Path(db_path)
 
 
-def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=15)
+def _db_path() -> Path:
+    """当前会话该用哪份库。
+
+    以前这里直接读模块全局 DB_PATH，多老师同时在线时会互相覆盖(串号)。
+    现在优先读 st.session_state —— 它是按会话隔离的，各用各的。
+    """
+    try:
+        path = st.session_state.get("db_path")
+        if path:
+            return Path(path)
+    except Exception:
+        pass
+    return Path(DB_PATH)
+
+
+def _connect(db_path: str | Path | None = None) -> sqlite3.Connection:
+    """默认连当前会话的库；显式传路径时连那个库（总后台操作别人的库时用）。"""
+    target = Path(db_path) if db_path is not None else _db_path()
+    conn = sqlite3.connect(target, timeout=15)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -49,7 +66,7 @@ def run(sql: str, params=()) -> int:
     try:
         cur = conn.execute(sql, _clean(params))
         conn.commit()
-        cloud_store.save_database(DB_PATH)
+        cloud_store.save_database(_db_path())
         return int(cur.lastrowid or 0)
     finally:
         conn.close()
@@ -65,7 +82,7 @@ def query(sql: str, params=()) -> pd.DataFrame:
 
 def _photos_dir() -> Path:
     try:
-        return Path(DB_PATH).parent / "photos"
+        return Path(_db_path()).parent / "photos"
     except Exception:
         return Path("data") / "photos"
 
@@ -130,10 +147,18 @@ def generate_password(length: int = 10) -> str:
     return f"{raw[:5]}-{raw[5:]}"
 
 
-def init_user_db(db_path: str | Path | None = None, default_teacher_password: str | None = None) -> None:
-    if db_path is not None:
-        configure(db_path)
-    conn = _connect()
+def init_user_db(
+    db_path: str | Path | None = None,
+    default_teacher_password: str | None = None,
+    object_path: str | None = None,
+) -> None:
+    """建账号相关表并（首次）创建老师账号。
+
+    object_path 显式指定云端保存路径；不传则按当前会话的库走。
+    总后台操作别人的库时必须传，否则会把别人的库上传到你自己的云端路径上。
+    """
+    target = Path(db_path) if db_path is not None else _db_path()
+    conn = _connect(target)
     try:
         conn.executescript(
             """
@@ -222,9 +247,60 @@ def init_user_db(db_path: str | Path | None = None, default_teacher_password: st
                 ),
             )
         conn.commit()
-        cloud_store.save_database(DB_PATH)
+        cloud_store.save_database(target, object_path)
     finally:
         conn.close()
+
+
+def create_account_in(
+    db_path: str | Path,
+    username: str,
+    password: str,
+    role: str,
+    student_id: int | None = None,
+    must_change_password: bool = True,
+    note: str = "",
+) -> tuple[bool, str]:
+    """在**指定**数据库里创建账号（总后台替某位老师开账号时用）。
+
+    不依赖当前会话的库，所以不会影响操作者自己的数据。
+    """
+    target = Path(db_path)
+    name = str(username or "").strip()
+    if not name:
+        return False, "请填写账号"
+    if len(str(password or "")) < 6:
+        return False, "初始密码至少 6 位"
+    if role not in (ROLE_TEACHER, ROLE_STUDENT):
+        return False, "身份不合法"
+    conn = _connect(target)
+    try:
+        if conn.execute("SELECT 1 FROM users WHERE username=? COLLATE NOCASE", (name,)).fetchone():
+            return False, "这个账号已经存在了"
+        if student_id is not None:
+            bound = conn.execute(
+                "SELECT username FROM users WHERE student_id=?", (int(student_id),)
+            ).fetchone()
+            if bound:
+                return False, f"这位学生已经有账号了（{bound['username']}）"
+        conn.execute(
+            """INSERT INTO users(username, password_hash, role, student_id, active,
+                                 must_change_password, created_at, note)
+               VALUES(?,?,?,?,1,?,?,?)""",
+            (
+                name,
+                hash_password(str(password)),
+                role,
+                int(student_id) if student_id is not None else None,
+                1 if must_change_password else 0,
+                _now(),
+                note,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return True, ""
 
 
 def _audit(username: str, action: str, detail: str = "") -> None:
@@ -335,9 +411,26 @@ def current_user():
 
 
 def logout() -> None:
-    for key in ("auth_user_id", "auth_username", "auth_role", "auth_student_id", "page"):
+    for key in (
+        "auth_user_id", "auth_username", "auth_role", "auth_student_id", "page",
+        # 退出后必须一并清掉「当前用哪份库」，否则换账号登录可能残留上一位老师的数据
+        "db_path", "db_slug",
+    ):
         st.session_state.pop(key, None)
     st.rerun()
+
+
+_login_router = None
+
+
+def set_login_router(router) -> None:
+    """登录前先定位这个账号属于哪份数据库。
+
+    多老师之后，光有账号密码还不够——得先知道该去哪一份库里验证。
+    app.py 通过这里挂一个路由函数进来，定位好库再继续验证密码。
+    """
+    global _login_router
+    _login_router = router
 
 
 def render_login() -> None:
@@ -357,6 +450,11 @@ def render_login() -> None:
         password = st.text_input("密码", type="password")
         ok = st.form_submit_button("登录", type="primary", use_container_width=True)
     if ok:
+        if _login_router is not None:
+            route_error = _login_router(username)
+            if route_error:
+                st.error(route_error)
+                return
         user, error = authenticate(username, password)
         if user:
             st.session_state["auth_user_id"] = int(user["id"])

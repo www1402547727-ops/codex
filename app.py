@@ -10,8 +10,10 @@ import streamlit as st
 import streamlit.components.v1 as components
 from PIL import Image, ImageOps
 
+import admin_console
 import cloud_store
 import course_management as cm
+import teacher_registry
 import ui_theme
 import user_management as um
 
@@ -25,19 +27,34 @@ WD = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 BASE = Path(__file__).parent
 st.set_page_config(page_title="教务工作台", page_icon="📒", layout="wide")
 cloud_store.configure_from_streamlit()
-DATA = cloud_store.get_data_dir(BASE / "data")
+teacher_registry.configure(BASE / "data")
+
+# ==================== 定位当前会话用哪一份数据库 ====================
+# 每位老师一份独立数据库：已登录时按登录名定位到他那一份；
+# 未登录时只准备名册(几 KB)，不下载任何老师的数据库。
+SESSION_SLUG = teacher_registry.session_slug()
+ACTIVE_SLUG = SESSION_SLUG or cloud_store.DEFAULT_SLUG
+DATA = cloud_store.get_data_dir(BASE / "data", ACTIVE_SLUG)
 PHOTOS = DATA / "photos"
 DB = DATA / "scores.db"
 PHOTOS.mkdir(parents=True, exist_ok=True)
-try:
-    database_found = cloud_store.prepare_database(DB)
-except Exception as exc:
-    st.error(f"无法读取云端数据库：{exc}")
-    st.stop()
-if cloud_store.is_cloud() and not database_found:
-    st.error("云端数据库尚未初始化。请先把本地 data/scores.db 上传到 Supabase Storage 的 database/scores.db。")
-    st.stop()
+cloud_store.set_session_slug(ACTIVE_SLUG)
+
 ui_theme.inject()
+
+if SESSION_SLUG is None:
+    default_db = cloud_store.get_data_dir(BASE / "data", cloud_store.DEFAULT_SLUG) / "scores.db"
+    if cloud_store.is_cloud():
+        try:
+            cloud_store.prepare_database(default_db, cloud_store.db_object_path(cloud_store.DEFAULT_SLUG))
+        except Exception:
+            pass  # 名册若已存在，这一步失败也不影响登录
+    try:
+        teacher_registry.ensure_ready(default_db)
+    except teacher_registry.RosterUnavailable as exc:
+        # 安全阀：读不到现有账号时宁可报错重试，也绝不写一份空名册把所有人锁在门外
+        st.error(str(exc))
+        st.stop()
 
 
 # 把「添加到主屏幕」需要的 meta / manifest 注入到页面 <head>（iPhone、安卓通用）
@@ -191,8 +208,14 @@ def _merge_duplicate_students(conn) -> list:
     return merged
 
 
-def init_db():
-    conn = sqlite3.connect(DB)
+def init_db(db_path=None, object_path=None):
+    """建表 + 迁移。
+
+    传入 db_path / object_path 时作用在指定库上（总后台给新老师建库要用）。
+    不传则作用在当前会话的库上。
+    """
+    target = db_path or DB
+    conn = sqlite3.connect(target)
     conn.executescript(SCHEMA)
     for table, cols in ADD_COLS.items():
         have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
@@ -267,7 +290,11 @@ def init_db():
                       f"把 {promoted} 场考试的学生试卷提升为共用试卷"))
     conn.commit()
     conn.close()
-    cloud_store.save_database(DB)
+    cloud_store.save_database(target, object_path)
+
+
+# 总后台要给新老师建库，得复用这里的建表逻辑（用回调避免循环 import）
+admin_console.configure(init_db)
 
 
 # ==================== 工具函数 ====================
@@ -1657,11 +1684,70 @@ def page_exams():
 
 
 # ==================== 登录 & 导航 ====================
-init_db()
-cm.configure(DB)
-cm.init_course_db(DB)
-um.configure(DB)
-um.init_user_db(DB, default_teacher_password=PASSWORD)
+def activate_database(slug: str) -> tuple[bool, str]:
+    """把当前会话切到指定老师的数据库：定位路径 → 只下载他那一份 → 建表。"""
+    global DATA, PHOTOS, DB
+    data_dir = cloud_store.get_data_dir(BASE / "data", slug)
+    photos = data_dir / "photos"
+    photos.mkdir(parents=True, exist_ok=True)
+    db = data_dir / "scores.db"
+    cloud_store.set_session_slug(slug)
+    st.session_state["db_slug"] = slug
+    st.session_state["db_path"] = str(db)
+    try:
+        found = cloud_store.prepare_database(db, cloud_store.db_object_path(slug))
+    except Exception as exc:
+        return False, f"无法读取云端数据库：{exc}"
+    if cloud_store.is_cloud() and not found:
+        return False, "这位老师的数据还没有初始化，请联系管理员。"
+    DATA, PHOTOS, DB = data_dir, photos, db
+    init_db()
+    cm.configure(DB)
+    cm.init_course_db(DB)
+    um.configure(DB)
+    try:
+        um.init_user_db(
+            DB,
+            default_teacher_password=PASSWORD if cloud_store.is_default_slug(slug) else None,
+        )
+    except RuntimeError as exc:
+        return False, str(exc)
+    # 把这位老师库里的登录名同步进名册，新开的学生账号马上就能登录
+    teacher_registry.note_usernames(slug, DB)
+    # 顺手把自己的汇总上报给名册（每次会话只做一次），总后台就不用挨个下载所有人的库
+    if not st.session_state.get("_stats_reported"):
+        try:
+            teacher_registry.note_stats(slug, DB)
+        except Exception:
+            pass
+        st.session_state["_stats_reported"] = True
+    return True, ""
+
+
+def route_login(username: str) -> str:
+    """登录前先定位账号属于哪份数据库。返回错误信息，空字符串表示可以继续验证密码。"""
+    name = str(username or "").strip()
+    if not name:
+        return "请输入账号和密码"
+    slug = teacher_registry.find_slug(name)
+    if slug is None:
+        # 和「密码错误」用同一句提示，不泄露账号是否存在
+        return "账号或密码错误"
+    ok, error = activate_database(slug)
+    return "" if ok else error
+
+
+um.set_login_router(route_login)
+
+if SESSION_SLUG is None:
+    # 还没登录：只显示登录页，不加载任何老师的数据
+    um.render_login()
+    st.stop()
+
+ok, activate_error = activate_database(SESSION_SLUG)
+if not ok:
+    st.error(activate_error)
+    st.stop()
 
 user = um.current_user()
 if user is None:
@@ -1681,9 +1767,13 @@ if user["role"] == um.ROLE_TEACHER:
         "学生": page_students,
         "授课统计": cm.page_stats,
         "考试成绩": page_exams,
-        "账号管理": um.page_user_admin,
-        "账号": um.page_account,
     }
+    # 只有创始者能开账号（老师账号和学生账号都是）；其他老师看不到「账号管理」
+    IS_ADMIN = bool((teacher_registry.teacher_entry(SESSION_SLUG) or {}).get("is_admin"))
+    if IS_ADMIN:
+        PAGES["账号管理"] = um.page_user_admin
+        PAGES["总后台"] = admin_console.page_admin
+    PAGES["账号"] = um.page_account
 else:
     PAGES = {
         "我的课程": um.page_student_courses,
@@ -1753,5 +1843,9 @@ if user["role"] == um.ROLE_TEACHER:
 else:
     NAV = dict(PAGES)
 
-page = st.sidebar.radio("导航", list(NAV), key="page")
+nav_options = list(NAV)
+if st.session_state.get("page") not in nav_options:
+    # 权限变化后残留的旧页面名，兜底回到第一项，避免报错
+    st.session_state["page"] = nav_options[0]
+page = st.sidebar.radio("导航", nav_options, key="page")
 NAV[page]()

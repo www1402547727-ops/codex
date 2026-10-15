@@ -65,8 +65,21 @@ def configure(db_path: str | Path) -> None:
     DB_PATH = Path(db_path)
 
 
-def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=15)
+def _db_path() -> Path:
+    """当前会话该用哪份库。优先读 st.session_state(按会话隔离)，避免多老师串号。"""
+    try:
+        path = st.session_state.get("db_path")
+        if path:
+            return Path(path)
+    except Exception:
+        pass
+    return Path(DB_PATH)
+
+
+def _connect(db_path: str | Path | None = None) -> sqlite3.Connection:
+    """默认连当前会话的库；显式传路径时连那个库（总后台操作别人的库时用）。"""
+    target = Path(db_path) if db_path is not None else _db_path()
+    conn = sqlite3.connect(target, timeout=15)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -80,7 +93,7 @@ def run(sql: str, params=()) -> int:
     try:
         cur = conn.execute(sql, _clean(params))
         conn.commit()
-        cloud_store.save_database(DB_PATH)
+        cloud_store.save_database(_db_path())
         return int(cur.lastrowid or 0)
     finally:
         conn.close()
@@ -117,14 +130,18 @@ def _backfill_one_to_one_students(conn: sqlite3.Connection) -> int:
     return n
 
 
-def init_course_db(db_path: str | Path | None = None) -> None:
-    if db_path is not None:
-        configure(db_path)
-    conn = _connect()
+def init_course_db(db_path: str | Path | None = None, object_path: str | None = None) -> None:
+    """建课程相关表与视图。
+
+    object_path 显式指定云端保存路径；总后台操作别人的库时必须传，
+    否则会把别人的库上传到你自己的云端路径上。
+    """
+    target = Path(db_path) if db_path is not None else _db_path()
+    conn = _connect(target)
     try:
         if _backfill_one_to_one_students(conn):
             conn.commit()
-            cloud_store.save_database(DB_PATH)
+            cloud_store.save_database(target, object_path)
         version = int(conn.execute("PRAGMA user_version").fetchone()[0])
         view_exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type='view' AND name='v_lessons'").fetchone()
         hour_table_exists = conn.execute(
@@ -343,7 +360,7 @@ def init_course_db(db_path: str | Path | None = None) -> None:
         )
         conn.execute("PRAGMA user_version=5")
         conn.commit()
-        cloud_store.save_database(DB_PATH)
+        cloud_store.save_database(target, object_path)
     finally:
         conn.close()
 
