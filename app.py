@@ -1576,13 +1576,22 @@ def tab_manage():
                                      type=["jpg", "jpeg", "png", "pdf"], accept_multiple_files=True)
         st.caption("填了学校和年级后，录分名单=该学校该年级的全部学生（班课 + 一对一都会进来）。")
         if st.form_submit_button("添加考试", type="primary") and n.strip():
+            names = ""
+            if paper_new:
+                try:
+                    names = save_photos(paper_new, "e0_exampaper")
+                except Exception as exc:
+                    st.error(f"试卷上传失败，考试没有创建：{exc}")
+                    st.stop()
             new_eid = run("""INSERT INTO exams(name, exam_date, subject, full_score, class_id, category, school, grade)
                              VALUES(?,?,?,?,?,?,?,?)""",
                           (n.strip(), str(d), s, f, c or None, cat, school.strip(), grade.strip()))
-            if paper_new:
-                names = save_photos(paper_new, f"e{int(new_eid)}_exampaper")
+            if names:
                 run("UPDATE exams SET paper=? WHERE id=?", (names, int(new_eid)))
-            st.session_state["exam_msg"] = f"已添加考试「{n.strip()}」"
+            st.session_state["exam_msg"] = (
+                f"已添加考试「{n.strip()}」，并上传 {file_count(names)} 张共用试卷"
+                if names else f"已添加考试「{n.strip()}」"
+            )
             st.rerun()
 
     # ---------- 列表 + 筛选 ----------
@@ -1666,13 +1675,22 @@ def tab_manage():
                                      accept_multiple_files=True, key=f"exam_paper_{pick}")
         b1, b4, b2 = st.columns(3)
         if b1.form_submit_button("💾 保存修改", type="primary"):
+            added = ""
+            if paper_add:
+                try:
+                    added = save_photos(paper_add, f"e{int(pick)}_exampaper")
+                except Exception as exc:
+                    st.error(f"试卷上传失败，考试信息没有保存：{exc}")
+                    st.stop()
             run("""UPDATE exams SET name=?, exam_date=?, subject=?, full_score=?, class_id=?, category=?, school=?, grade=?
                    WHERE id=?""",
                 (n2.strip(), str(d2), s2, f2v, c2v or None, cat2, school2.strip(), grade2.strip(), int(pick)))
-            if paper_add:
-                added = save_photos(paper_add, f"e{int(pick)}_exampaper")
+            if added:
                 run("UPDATE exams SET paper=? WHERE id=?", ((cur_paper + "|" + added).strip("|"), int(pick)))
-            st.session_state["exam_msg"] = f"考试「{n2.strip()}」已保存"
+            st.session_state["exam_msg"] = (
+                f"考试「{n2.strip()}」已保存，并上传 {file_count(added)} 张共用试卷"
+                if added else f"考试「{n2.strip()}」已保存"
+            )
             st.rerun()
         if b4.form_submit_button("🗑 清空共用试卷"):
             run("UPDATE exams SET paper='' WHERE id=?", (int(pick),))
