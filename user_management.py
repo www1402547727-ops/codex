@@ -8,6 +8,7 @@ import secrets
 import html
 import sqlite3
 import string
+import sys
 import time
 from datetime import date, datetime
 from pathlib import Path
@@ -93,9 +94,12 @@ def _show_media(joined, caption: str = "") -> None:
     for n in names:
         try:
             path = cloud_store.ensure_local_photo(n, _photos_dir())
-        except Exception:
+        except Exception as exc:
+            st.warning(f"{caption}暂时加载失败，请刷新页面重试。")
+            print(f"[student_media] 加载{caption}失败：{n}：{exc}", file=sys.stderr)
             continue
         if not path.exists():
+            st.warning(f"{caption}文件暂时找不到，请联系老师重新上传。")
             continue
         if path.suffix.lower() == ".pdf":
             st.download_button(
@@ -799,29 +803,53 @@ def page_student_scores() -> None:
         st.error("学生账号未正确绑定，请联系老师")
         st.stop()
     st.title("我的成绩")
+    sid = int(user["student_id"])
     df = query(
-        """SELECT sc.id, sc.score, sc.wrong_qs, sc.knowledge, sc.note,
+        """SELECT e.id AS exam_id, e.name AS exam_name, e.exam_date, e.subject, e.full_score,
+                  COALESCE(e.school,'') AS school, COALESCE(e.grade,'') AS grade,
+                  sc.id AS score_id, sc.score, sc.wrong_qs, sc.knowledge, sc.note,
+                  COALESCE(sc.status,'') AS status,
                   sc.paper, sc.sheet, COALESCE(e.paper,'') AS exam_paper,
-                  e.name AS exam_name, e.exam_date, e.subject, e.full_score
-           FROM scores sc
-           JOIN exams e ON e.id=sc.exam_id
-           WHERE sc.student_id=?
+                  CASE
+                      WHEN sc.id IS NULL THEN '未录入'
+                      WHEN COALESCE(sc.status,'')<>'' THEN sc.status
+                      WHEN sc.score IS NOT NULL THEN '已录入'
+                      ELSE '未录入'
+                  END AS display_status
+           FROM exams e
+           JOIN students s ON s.id=?
+           LEFT JOIN scores sc ON sc.exam_id=e.id AND sc.student_id=s.id
+           WHERE (
+               (COALESCE(TRIM(e.school),'')<>'' OR COALESCE(TRIM(e.grade),'')<>'')
+               AND (COALESCE(TRIM(e.school),'')='' OR TRIM(e.school)=TRIM(COALESCE(s.school,'')))
+               AND (COALESCE(TRIM(e.grade),'')='' OR TRIM(e.grade)=TRIM(COALESCE(s.grade,'')))
+           )
+           OR (
+               COALESCE(TRIM(e.school),'')='' AND COALESCE(TRIM(e.grade),'')=''
+               AND (
+                   (e.class_id IS NOT NULL AND e.class_id IN (
+                       SELECT class_id FROM class_members WHERE student_id=?
+                   ))
+                   OR (e.class_id IS NULL AND sc.id IS NOT NULL)
+               )
+           )
            ORDER BY e.exam_date DESC, e.id DESC""",
-        (int(user["student_id"]),),
+        (sid, sid),
     )
     if df.empty:
-        st.info("暂时没有成绩记录。")
+        st.info("暂时没有可查看的考试记录。")
         return
 
     df["得分率%"] = (pd.to_numeric(df["score"], errors="coerce") / pd.to_numeric(df["full_score"], errors="coerce") * 100).round(1)
     st.dataframe(
-        df[["exam_date", "exam_name", "subject", "score", "full_score", "得分率%"]].rename(
+        df[["exam_date", "exam_name", "subject", "score", "full_score", "得分率%", "display_status"]].rename(
             columns={
                 "exam_date": "日期",
                 "exam_name": "考试名称",
                 "subject": "科目",
                 "score": "分数",
                 "full_score": "满分",
+                "display_status": "状态",
             }
         ),
         hide_index=True,
@@ -833,13 +861,21 @@ def page_student_scores() -> None:
 
     st.subheader("考试详情")
     for _, row in df.iterrows():
-        score_text = "—" if pd.isna(row["score"]) else f"{float(row['score']):g}"
+        has_score = pd.notna(row["score"])
+        score_text = f"{float(row['score']):g}" if has_score else "—"
         full_text = "—" if pd.isna(row["full_score"]) else f"{float(row['full_score']):g}"
-        with st.expander(f"{row['exam_date']}　{row['exam_name']}　{score_text}/{full_text}"):
+        status_text = str(row["display_status"])
+        summary = f"{score_text}/{full_text}" if has_score or status_text == "缺考" else status_text
+        with st.expander(f"{row['exam_date']}　{row['exam_name']}　{summary}"):
             st.write(f"**科目：** {row['subject'] or '—'}")
-            st.write(f"**分数：** {score_text}/{full_text}")
-            st.write(f"**错题：** {row['wrong_qs'] or '—'}")
-            st.write(f"**薄弱知识点：** {row['knowledge'] or '—'}")
+            st.write(f"**状态：** {status_text}")
+            if has_score:
+                st.write(f"**分数：** {score_text}/{full_text}")
+            if pd.notna(row["score_id"]):
+                st.write(f"**错题：** {row['wrong_qs'] or '—'}")
+                st.write(f"**薄弱知识点：** {row['knowledge'] or '—'}")
+            else:
+                st.caption("成绩和试卷分析还没有录入，老师录入后刷新页面就能看到。")
             note = str(row.get("note") or "").strip()
             if note:
                 st.markdown("**试卷分析**")
