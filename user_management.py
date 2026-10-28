@@ -398,6 +398,35 @@ def _audit(username: str, action: str, detail: str = "") -> None:
     )
 
 
+def _platform_audit(
+    action: str,
+    *,
+    actor_user_id: int | None = None,
+    actor_role: str = "",
+    org_id: int | None = None,
+    target_type: str = "",
+    target_id: str | int = "",
+    detail: str = "",
+    reason: str = "",
+) -> None:
+    """写平台审计，但不让审计故障影响登录或账号操作。"""
+    try:
+        import platform_store
+
+        platform_store.record_audit(
+            action,
+            actor_user_id=actor_user_id,
+            actor_role=actor_role,
+            org_id=org_id,
+            target_type=target_type,
+            target_id=target_id,
+            detail=detail,
+            reason=reason,
+        )
+    except Exception as exc:
+        print(f"[user_management] 写平台审计失败：{exc}", file=sys.stderr)
+
+
 def _record_login_attempt(username: str, success: bool) -> None:
     conn = _connect()
     try:
@@ -465,12 +494,30 @@ def authenticate(username: str, password: str) -> tuple[dict | None, str]:
         return None, "请输入账号和密码"
     remaining = login_lock_remaining(username)
     if remaining:
+        _platform_audit(
+            "login_failed",
+            actor_role="anonymous",
+            target_type="account",
+            target_id=username,
+            detail="locked",
+        )
         return None, f"登录失败次数过多，请在 {max(1, (remaining + 59) // 60)} 分钟后重试"
 
     row = _get_user_by_username(username)
     if row is None or not verify_password(str(password), str(row["password_hash"])):
         _record_login_attempt(username, False)
         _audit(username, "login_failed")
+        failed_org_id = None
+        if row is not None and pd.notna(row.get("org_id")):
+            failed_org_id = int(row["org_id"])
+        _platform_audit(
+            "login_failed",
+            actor_role="anonymous",
+            org_id=failed_org_id,
+            target_type="account",
+            target_id=username,
+            detail="invalid_credentials",
+        )
         time.sleep(0.5)
         remaining = login_lock_remaining(username)
         if remaining:
@@ -478,6 +525,15 @@ def authenticate(username: str, password: str) -> tuple[dict | None, str]:
         return None, "账号或密码错误"
     if int(row["active"] or 0) != 1:
         _audit(username, "login_blocked_inactive")
+        _platform_audit(
+            "login_failed",
+            actor_user_id=int(row["id"]),
+            actor_role=str(row["role"]),
+            org_id=int(row["org_id"]) if pd.notna(row.get("org_id")) else None,
+            target_type="account",
+            target_id=username,
+            detail="inactive",
+        )
         return None, "该账号已停用，请联系老师"
 
     _record_login_attempt(username, True)
@@ -500,7 +556,8 @@ def current_user():
 
 def logout() -> None:
     for key in (
-        "auth_user_id", "auth_username", "auth_role", "auth_student_id", "page",
+        "auth_user_id", "auth_username", "auth_role", "auth_student_id",
+        "auth_actor_role", "auth_org_id", "_platform_login_audited", "page",
         # 退出后必须一并清掉「当前用哪份库」，否则换账号登录可能残留上一位老师的数据
         "db_path", "db_slug",
     ):
@@ -548,6 +605,10 @@ def render_login() -> None:
             st.session_state["auth_user_id"] = int(user["id"])
             st.session_state["auth_username"] = str(user["username"])
             st.session_state["auth_role"] = str(user["role"])
+            st.session_state["auth_actor_role"] = str(user["role"])
+            st.session_state["auth_org_id"] = (
+                int(user["org_id"]) if pd.notna(user.get("org_id")) else None
+            )
             st.session_state.pop("page", None)
             st.session_state["auth_student_id"] = (
                 int(user["student_id"]) if pd.notna(user.get("student_id")) else None
@@ -611,6 +672,16 @@ def page_account(force_change: bool = False) -> None:
                 (hash_password(new1), int(user["id"])),
             )
             _audit(str(user["username"]), "change_password")
+            try:
+                import platform_store
+
+                platform_store.record_current_audit(
+                    "change_password",
+                    target_type="account",
+                    target_id=str(user["username"]),
+                )
+            except Exception as exc:
+                print(f"[user_management] 写平台审计失败：{exc}", file=sys.stderr)
             st.success("密码已修改，请使用新密码重新登录")
             logout()
 
@@ -658,6 +729,17 @@ def _create_student_account(
         ),
     )
     _audit(username, "student_account_created", f"student_id={int(student_id)}")
+    try:
+        import platform_store
+
+        platform_store.record_current_audit(
+            "create_student_account",
+            target_type="account",
+            target_id=username,
+            detail=f"student_id={int(student_id)}",
+        )
+    except Exception as exc:
+        print(f"[user_management] 写平台审计失败：{exc}", file=sys.stderr)
     return True, ""
 
 
@@ -672,6 +754,17 @@ def _delete_student_account(user_id: int, actor: str) -> str:
     run("DELETE FROM users WHERE id=?", (int(user_id),))
     run("DELETE FROM user_login_attempts WHERE username=?", (username,))
     _audit(str(actor), "student_account_deleted", f"username={username}")
+    try:
+        import platform_store
+
+        platform_store.record_current_audit(
+            "delete_student_account",
+            target_type="account",
+            target_id=username,
+            detail=f"user_id={int(user_id)}",
+        )
+    except Exception as exc:
+        print(f"[user_management] 写平台审计失败：{exc}", file=sys.stderr)
     return username
 
 
@@ -780,6 +873,17 @@ def page_user_admin(allow_delete: bool = True) -> None:
             (hash_password(new_password), int(selected)),
         )
         _audit(str(user["username"]), "reset_student_password", f"user_id={int(selected)}")
+        try:
+            import platform_store
+
+            platform_store.record_current_audit(
+                "reset_student_password",
+                target_type="account",
+                target_id=str(row["username"]),
+                detail=f"user_id={int(selected)}",
+            )
+        except Exception as exc:
+            print(f"[user_management] 写平台审计失败：{exc}", file=sys.stderr)
         st.session_state["account_reset"] = {
             "username": str(row["username"]),
             "password": new_password,
@@ -794,6 +898,17 @@ def page_user_admin(allow_delete: bool = True) -> None:
             "enable_student_account" if target_active else "disable_student_account",
             f"user_id={int(selected)}",
         )
+        try:
+            import platform_store
+
+            platform_store.record_current_audit(
+                "enable_student_account" if target_active else "disable_student_account",
+                target_type="account",
+                target_id=str(row["username"]),
+                detail=f"user_id={int(selected)}",
+            )
+        except Exception as exc:
+            print(f"[user_management] 写平台审计失败：{exc}", file=sys.stderr)
         st.rerun()
 
     if allow_delete:

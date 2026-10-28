@@ -169,6 +169,29 @@ def query(sql, params=()):
         conn.close()
 
 
+def _platform_audit(
+    action: str,
+    *,
+    target_type: str = "",
+    target_id: str | int = "",
+    detail: str = "",
+    reason: str = "",
+    org_id: int | None = None,
+) -> None:
+    """平台审计失败不能影响业务保存。"""
+    try:
+        platform_store.record_current_audit(
+            action,
+            target_type=target_type,
+            target_id=target_id,
+            detail=detail,
+            reason=reason,
+            org_id=org_id,
+        )
+    except Exception as exc:
+        print(f"[app] 写平台审计失败：{exc}", file=sys.stderr)
+
+
 def _session_db_path() -> Path:
     """当前会话的数据库路径；避免 app.py 模块级 DB 在会话交替时串库。"""
     return cloud_store.session_db_path(DB)
@@ -1165,6 +1188,13 @@ def save_entry_changes(eid, changes, old_map):
         else:
             if exist:
                 run("DELETE FROM scores WHERE student_id=? AND exam_id=?", (sid, eid))
+                score_id = row_val(o, "id", "")
+                _platform_audit(
+                    "delete_score",
+                    target_type="score",
+                    target_id=score_id or f"{eid}:{sid}",
+                    detail=f"exam_id={eid};student_id={sid}",
+                )
                 cleared += 1
     return saved, absent, cleared, skipped
 
@@ -1726,6 +1756,11 @@ def tab_manage():
                 st.error(f"这场考试已经有 {cnt} 条成绩，请先清掉成绩再删考试")
             else:
                 run("DELETE FROM exams WHERE id=?", (int(pick),))
+                _platform_audit(
+                    "delete_exam",
+                    target_type="exam",
+                    target_id=int(pick),
+                )
                 st.session_state["exam_msg"] = f"考试「{ex['name']}」已删除"
                 st.rerun()
 
@@ -1790,12 +1825,44 @@ def route_login(username: str) -> str:
     """登录前先定位账号属于哪份数据库。返回错误信息，空字符串表示可以继续验证密码。"""
     name = str(username or "").strip()
     if not name:
+        try:
+            platform_store.record_audit(
+                "login_failed",
+                actor_role="anonymous",
+                target_type="account",
+                target_id="",
+                detail="missing_username",
+            )
+        except Exception as exc:
+            print(f"[app] 写登录审计失败：{exc}", file=sys.stderr)
         return "请输入账号和密码"
     slug = teacher_registry.find_slug(name)
     if slug is None:
+        try:
+            platform_store.record_audit(
+                "login_failed",
+                actor_role="anonymous",
+                target_type="account",
+                target_id=name,
+                detail="route_not_found",
+            )
+        except Exception as exc:
+            print(f"[app] 写登录审计失败：{exc}", file=sys.stderr)
         # 和「密码错误」用同一句提示，不泄露账号是否存在
         return "账号或密码错误"
     ok, error = activate_database(slug)
+    if not ok:
+        try:
+            platform_store.record_audit(
+                "login_failed",
+                actor_role="anonymous",
+                org_id=platform_store.org_id_for_slug(slug),
+                target_type="account",
+                target_id=name,
+                detail="activation_failed",
+            )
+        except Exception as exc:
+            print(f"[app] 写登录审计失败：{exc}", file=sys.stderr)
     return "" if ok else error
 
 
@@ -1815,6 +1882,39 @@ user = um.current_user()
 if user is None:
     um.render_login()
     st.stop()
+
+# 登录成功后再记录审计：这里才知道当前账号是不是平台管理员或机构管理员。
+if user["role"] == um.ROLE_TEACHER:
+    teacher_entry = teacher_registry.teacher_entry(SESSION_SLUG) or {}
+    org_member = platform_store.org_user_for_slug(SESSION_SLUG) or {}
+    if bool(teacher_entry.get("is_admin")):
+        actor_role = "platform_admin"
+    elif org_member.get("role") == platform_store.ROLE_ORG_ADMIN:
+        actor_role = "org_admin"
+    else:
+        actor_role = "teacher"
+else:
+    actor_role = "student"
+auth_org_id = user.get("org_id")
+if pd.isna(auth_org_id):
+    auth_org_id = platform_store.org_id_for_slug(SESSION_SLUG)
+st.session_state["auth_actor_role"] = actor_role
+st.session_state["auth_org_id"] = (
+    int(auth_org_id) if auth_org_id is not None and pd.notna(auth_org_id) else None
+)
+if not st.session_state.get("_platform_login_audited"):
+    try:
+        platform_store.record_audit(
+            "login_success",
+            actor_user_id=int(user["id"]),
+            actor_role=actor_role,
+            org_id=st.session_state.get("auth_org_id"),
+            target_type="account",
+            target_id=str(user["username"]),
+        )
+    except Exception as exc:
+        print(f"[app] 写登录审计失败：{exc}", file=sys.stderr)
+    st.session_state["_platform_login_audited"] = True
 
 um.render_sidebar_identity()
 if int(user.get("must_change_password") or 0) == 1:

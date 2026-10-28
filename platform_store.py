@@ -20,6 +20,11 @@ from pathlib import Path
 
 import cloud_store
 
+try:
+    import streamlit as st
+except Exception:
+    st = None
+
 ROLE_TEACHER = "teacher"
 ROLE_ORG_ADMIN = "org_admin"
 ROLE_LABELS = {
@@ -88,6 +93,22 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_org_user_roles_org
             ON org_user_roles(org_id, role);
+        CREATE TABLE IF NOT EXISTS audit_logs(
+            id INTEGER PRIMARY KEY,
+            at TEXT NOT NULL,
+            actor_user_id INTEGER,
+            actor_role TEXT NOT NULL DEFAULT '',
+            org_id INTEGER,
+            action TEXT NOT NULL,
+            target_type TEXT NOT NULL DEFAULT '',
+            target_id TEXT NOT NULL DEFAULT '',
+            detail TEXT NOT NULL DEFAULT '',
+            reason TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_audit_org_time
+            ON audit_logs(org_id, at);
+        CREATE INDEX IF NOT EXISTS idx_audit_actor_time
+            ON audit_logs(actor_role, at);
         """
     )
     # 兼容以后可能存在的旧版本表：只加字段，不删字段。
@@ -353,3 +374,135 @@ def is_org_admin(slug: str | None, org_id: int | None = None) -> bool:
 def is_personal_org(org_id: int | None) -> bool:
     org = get_organization(org_id)
     return bool(org and org.get("kind") == "个人")
+
+
+# ==================== 统一审计 ====================
+def current_actor() -> dict:
+    """从会话读取当前操作者；没有会话时返回匿名身份。"""
+    user_id = None
+    role = ""
+    org_id = None
+    if st is not None:
+        try:
+            user_id = st.session_state.get("auth_user_id")
+            role = str(st.session_state.get("auth_actor_role") or "")
+            org_id = st.session_state.get("auth_org_id")
+        except Exception:
+            pass
+    slug = cloud_store.current_slug()
+    if org_id is None:
+        org_id = org_id_for_slug(slug)
+    if not role:
+        member = org_user_for_slug(slug)
+        if member:
+            role = str(member.get("role") or ROLE_TEACHER)
+        elif user_id:
+            role = "teacher"
+    return {
+        "actor_user_id": int(user_id) if user_id else None,
+        "actor_role": role or "anonymous",
+        "org_id": int(org_id) if org_id is not None else None,
+    }
+
+
+def record_audit(
+    action: str,
+    *,
+    actor_user_id: int | None = None,
+    actor_role: str = "",
+    org_id: int | None = None,
+    target_type: str = "",
+    target_id: str | int = "",
+    detail: str = "",
+    reason: str = "",
+) -> None:
+    """写一条平台级审计记录。detail 只放类型、id 和原因码，不放学生内容。"""
+    clean_action = str(action or "").strip()
+    if not clean_action:
+        return
+    with _lock:
+        conn = _connect()
+        try:
+            _init_schema(conn)
+            conn.execute(
+                """INSERT INTO audit_logs(
+                       at, actor_user_id, actor_role, org_id, action,
+                       target_type, target_id, detail, reason
+                   ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                (
+                    _now(),
+                    int(actor_user_id) if actor_user_id is not None else None,
+                    str(actor_role or ""),
+                    int(org_id) if org_id is not None else None,
+                    clean_action,
+                    str(target_type or ""),
+                    str(target_id or ""),
+                    str(detail or ""),
+                    str(reason or ""),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        try:
+            _save()
+        except Exception as exc:
+            print(f"[platform_store] 保存审计日志失败：{exc}", file=sys.stderr)
+
+
+def record_current_audit(
+    action: str,
+    *,
+    target_type: str = "",
+    target_id: str | int = "",
+    detail: str = "",
+    reason: str = "",
+    org_id: int | None = None,
+) -> None:
+    actor = current_actor()
+    record_audit(
+        action,
+        actor_user_id=actor["actor_user_id"],
+        actor_role=actor["actor_role"],
+        # 平台管理员操作某家机构时，调用方必须显式传目标机构；
+        # 不传才使用操作者自己的机构，避免日志全部落到默认机构。
+        org_id=actor["org_id"] if org_id is None else int(org_id),
+        target_type=target_type,
+        target_id=target_id,
+        detail=detail,
+        reason=reason,
+    )
+
+
+def list_audit(
+    *,
+    org_id: int | None = None,
+    actor_role: str | None = None,
+    limit: int = 100,
+) -> list[dict]:
+    path = platform_db_path()
+    if not path.is_file():
+        return []
+    clauses = []
+    params: list[object] = []
+    if org_id is not None:
+        clauses.append("org_id=?")
+        params.append(int(org_id))
+    if actor_role:
+        clauses.append("actor_role=?")
+        params.append(str(actor_role))
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    params.append(max(1, min(int(limit), 500)))
+    conn = _connect(path)
+    try:
+        _init_schema(conn)
+        rows = conn.execute(
+            f"""SELECT at, actor_user_id, actor_role, org_id, action,
+                       target_type, target_id, detail, reason
+                FROM audit_logs{where}
+                ORDER BY id DESC LIMIT ?""",
+            params,
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()

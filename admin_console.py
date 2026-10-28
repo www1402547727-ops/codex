@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import sqlite3
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -89,6 +90,92 @@ def _ago(value: str) -> str:
     return f"{int(delta.days)} 天前"
 
 
+def _record_platform_audit(
+    action: str,
+    *,
+    target_type: str = "",
+    target_id: str | int = "",
+    detail: str = "",
+    org_id: int | None = None,
+) -> None:
+    try:
+        platform_store.record_current_audit(
+            action,
+            target_type=target_type,
+            target_id=target_id,
+            detail=detail,
+            org_id=org_id,
+        )
+    except Exception as exc:
+        print(f"[admin_console] 写平台审计失败：{exc}", file=sys.stderr)
+
+
+def _render_platform_access_log(org_id: int) -> None:
+    """机构管理员可查看平台方对本机构做过什么，但不展示学生内容。"""
+    action_labels = {
+        "login_success": "登录",
+        "login_failed": "登录失败",
+        "change_password": "修改密码",
+        "create_teacher_account": "创建老师账号",
+        "rename_teacher_account": "修改老师账号",
+        "reset_teacher_password": "重置老师密码",
+        "enable_teacher_account": "启用老师账号",
+        "disable_teacher_account": "停用老师账号",
+        "create_student_account": "创建学生账号",
+        "delete_student_account": "删除学生账号",
+        "reset_student_password": "重置学生密码",
+        "enable_student_account": "启用学生账号",
+        "disable_student_account": "停用学生账号",
+        "delete_student": "删除学生资料",
+        "delete_score": "删除成绩",
+        "delete_exam": "删除考试",
+        "impersonate_start": "开始代入查看",
+        "impersonate_end": "结束代入查看",
+        "export": "导出数据",
+        "delete_organization": "删除机构",
+        "consent_accepted": "同意说明页",
+    }
+    target_labels = {
+        "account": "账号",
+        "teacher_account": "老师账号",
+        "student": "学生",
+        "score": "成绩",
+        "exam": "考试",
+        "organization": "机构",
+    }
+    records = platform_store.list_audit(
+        org_id=int(org_id),
+        actor_role="platform_admin",
+        limit=100,
+    )
+    with st.expander("平台方访问记录", expanded=False):
+        st.caption(
+            "只显示平台管理员对本机构账号和数据的操作，不显示学生姓名、成绩或试卷内容。"
+        )
+        if not records:
+            st.info("暂时没有平台方访问记录。")
+            return
+        table = pd.DataFrame(
+            [
+                {
+                    "时间": row.get("at") or "—",
+                    "操作": action_labels.get(
+                        str(row.get("action") or ""), str(row.get("action") or "—")
+                    ),
+                    "对象类型": target_labels.get(
+                        str(row.get("target_type") or ""),
+                        str(row.get("target_type") or "—"),
+                    ),
+                    "对象ID": str(row.get("target_id") or "—"),
+                    "详情": str(row.get("detail") or "—"),
+                    "原因": str(row.get("reason") or "—"),
+                }
+                for row in records
+            ]
+        )
+        st.dataframe(table, hide_index=True, use_container_width=True)
+
+
 # ==================== 开通 / 管理老师 ====================
 def create_teacher(
     display_name: str,
@@ -158,6 +245,13 @@ def create_teacher(
         return False, member_err
     cloud_store.save_database(db, object_path)
     teacher_registry.note_usernames(slug, db)
+    _record_platform_audit(
+        "create_teacher_account",
+        target_type="teacher_account",
+        target_id=slug,
+        detail=f"org_id={target_org_id}",
+        org_id=target_org_id,
+    )
     return True, ""
 
 
@@ -237,6 +331,12 @@ def rename_teacher(
             conn.close()
         teacher_registry.update_teacher(slug, username=old, display_name=entry.get("display_name") or "")
         return False, f"同步到云端失败，已全部退回原账号，请稍后重试：{exc}"
+    _record_platform_audit(
+        "rename_teacher_account",
+        target_type="teacher_account",
+        target_id=slug,
+        org_id=platform_store.org_id_for_slug(slug),
+    )
     return True, ""
 
 
@@ -260,6 +360,12 @@ def reset_teacher_password(slug: str, password: str) -> tuple[bool, str]:
     finally:
         conn.close()
     cloud_store.save_database(db, object_path)
+    _record_platform_audit(
+        "reset_teacher_password",
+        target_type="teacher_account",
+        target_id=slug,
+        org_id=platform_store.org_id_for_slug(slug),
+    )
     return True, ""
 
 
@@ -273,6 +379,12 @@ def set_teacher_active(slug: str, active: bool) -> tuple[bool, str]:
             # 硬性禁止：管理员被停用后就没人能进总后台了，没有别的入口能救回来
             return False, "管理员账号不能停用，否则总后台就进不去了"
     teacher_registry.update_teacher(slug, active=bool(active))
+    _record_platform_audit(
+        "enable_teacher_account" if active else "disable_teacher_account",
+        target_type="teacher_account",
+        target_id=slug,
+        org_id=platform_store.org_id_for_slug(slug),
+    )
     return True, ""
 
 
@@ -304,6 +416,13 @@ def create_organization_with_admin(
     )
     if org_id is None:
         return False, err, None
+    _record_platform_audit(
+        "create_organization",
+        target_type="organization",
+        target_id=org_id,
+        detail=f"kind={kind}",
+        org_id=org_id,
+    )
     ok, err = create_teacher(
         admin_display_name,
         name,
@@ -346,6 +465,13 @@ def org_set_teacher_active(
     if target_slug == actor_slug and not active:
         return False, "不能停用自己的账号"
     teacher_registry.update_teacher(target_slug, active=bool(active))
+    _record_platform_audit(
+        "enable_teacher_account" if active else "disable_teacher_account",
+        target_type="teacher_account",
+        target_id=target_slug,
+        detail=f"org_id={int(org_id)}",
+        org_id=org_id,
+    )
     return True, ""
 
 
@@ -459,6 +585,7 @@ def page_org_admin() -> None:
                 st.error(err)
 
     rows = org_teacher_rows(org_id)
+    _render_platform_access_log(org_id)
     st.subheader("本机构老师")
     if not rows:
         st.info("还没有老师账号。")
@@ -545,6 +672,13 @@ def create_student_account(
     )
     if not ok:
         return False, err
+    _record_platform_audit(
+        "create_student_account",
+        target_type="account",
+        target_id=name,
+        detail=f"student_id={int(student_id)}",
+        org_id=platform_store.org_id_for_slug(slug),
+    )
     cloud_store.save_database(db, object_path)
     teacher_registry.note_usernames(slug, db)
     return True, ""

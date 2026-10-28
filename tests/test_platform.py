@@ -5,12 +5,14 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import admin_console
 import cloud_store
 import platform_store
 import teacher_registry
 import user_management as um
+import streamlit as st
 
 
 def _test_root() -> Path:
@@ -52,6 +54,11 @@ def _init_fake_schema(path: Path, object_path=None) -> None:
                 id INTEGER PRIMARY KEY, name TEXT UNIQUE, grade TEXT,
                 subject TEXT, total_hours REAL DEFAULT 0,
                 note TEXT, kind TEXT DEFAULT '班课'
+            );
+            CREATE TABLE IF NOT EXISTS one_to_one_students(
+                id INTEGER PRIMARY KEY, name TEXT, grade TEXT, subject TEXT,
+                total_hours REAL DEFAULT 0, status TEXT DEFAULT '在读',
+                contact TEXT DEFAULT '', note TEXT DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS class_members(
                 class_id INTEGER, student_id INTEGER
@@ -249,6 +256,83 @@ class PlatformStoreTests(unittest.TestCase):
             self.assertEqual(int(user_org), int(org_id))
         finally:
             conn.close()
+        actions = {row["action"] for row in platform_store.list_audit(org_id=org_id)}
+        self.assertIn("create_organization", actions)
+        self.assertIn("create_teacher_account", actions)
+
+    def test_audit_logs_are_scoped_and_do_not_contain_content(self):
+        org_a, _ = platform_store.create_organization("测试机构审计甲")
+        org_b, _ = platform_store.create_organization("测试机构审计乙")
+        platform_store.record_audit(
+            "login_success",
+            actor_user_id=101,
+            actor_role="platform_admin",
+            org_id=org_a,
+            target_type="account",
+            target_id="test_account",
+            detail="",
+        )
+        platform_store.record_audit(
+            "delete_score",
+            actor_user_id=101,
+            actor_role="platform_admin",
+            org_id=org_b,
+            target_type="score",
+            target_id=42,
+            detail="exam_id=7;student_id=9",
+        )
+
+        rows_a = platform_store.list_audit(org_id=org_a)
+        rows_b = platform_store.list_audit(org_id=org_b)
+        self.assertEqual([row["action"] for row in rows_a], ["login_success"])
+        self.assertEqual([row["action"] for row in rows_b], ["delete_score"])
+        self.assertNotIn("假学生", str(rows_b))
+        self.assertNotIn("88", str(rows_b))
+
+    def test_current_audit_can_be_recorded_for_target_org(self):
+        org_a, _ = platform_store.create_organization("测试机构目标甲")
+        org_b, _ = platform_store.create_organization("测试机构目标乙")
+        state = {
+            "auth_user_id": 7,
+            "auth_actor_role": "platform_admin",
+            "auth_org_id": org_a,
+            "db_slug": "test_platform_admin",
+        }
+        with patch.object(st, "session_state", state):
+            platform_store.record_current_audit(
+                "delete_student",
+                target_type="student",
+                target_id=12,
+                org_id=org_b,
+            )
+
+        rows_a = platform_store.list_audit(org_id=org_a)
+        rows_b = platform_store.list_audit(org_id=org_b)
+        self.assertEqual(rows_a, [])
+        self.assertEqual(len(rows_b), 1)
+        self.assertEqual(rows_b[0]["actor_role"], "platform_admin")
+        self.assertEqual(rows_b[0]["action"], "delete_student")
+
+    def test_failed_login_is_audited_without_content(self):
+        org_id = platform_store.ensure_ready([])
+        db = self.base / "login_test" / "scores.db"
+        db.parent.mkdir(parents=True, exist_ok=True)
+        _init_fake_schema(db)
+        um.init_user_db(
+            db,
+            default_teacher_password="test-password",
+            object_path=cloud_store.db_object_path("login_test"),
+            org_id=org_id,
+        )
+        um.configure(db)
+
+        user, error = um.authenticate("teacher", "wrong-password")
+        self.assertIsNone(user)
+        self.assertTrue(error)
+        rows = platform_store.list_audit(org_id=org_id, actor_role="anonymous")
+        self.assertTrue(any(row["action"] == "login_failed" for row in rows))
+        self.assertTrue(any(row["detail"] == "invalid_credentials" for row in rows))
+        self.assertNotIn("wrong-password", str(rows))
 
     def test_org_admin_cannot_disable_another_org_teacher(self):
         org_a, _ = platform_store.create_organization("测试机构丙")

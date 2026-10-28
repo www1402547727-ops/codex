@@ -4,6 +4,7 @@ import calendar
 import html
 import re
 import sqlite3
+import sys
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
@@ -105,6 +106,27 @@ def query(sql: str, params=()) -> pd.DataFrame:
         return pd.read_sql_query(sql, conn, params=_clean(params))
     finally:
         conn.close()
+
+
+def _platform_audit(
+    action: str,
+    *,
+    target_type: str = "",
+    target_id: str | int = "",
+    detail: str = "",
+) -> None:
+    """平台审计失败不能影响课程数据操作。"""
+    try:
+        import platform_store
+
+        platform_store.record_current_audit(
+            action,
+            target_type=target_type,
+            target_id=target_id,
+            detail=detail,
+        )
+    except Exception as exc:
+        print(f"[course_management] 写平台审计失败：{exc}", file=sys.stderr)
 
 
 def _backfill_one_to_one_students(conn: sqlite3.Connection) -> int:
@@ -644,16 +666,24 @@ def uncomplete_course(course_id: int) -> None:
 
 def delete_course(course_id: int) -> None:
     conn = _connect()
+    deleted = False
     try:
         conn.execute("BEGIN IMMEDIATE")
         conn.execute("DELETE FROM lessons WHERE plan_id=?", (int(course_id),))
-        conn.execute("DELETE FROM plans WHERE id=?", (int(course_id),))
+        cur = conn.execute("DELETE FROM plans WHERE id=?", (int(course_id),))
+        deleted = cur.rowcount > 0
         conn.commit()
     except Exception:
         conn.rollback()
         raise
     finally:
         conn.close()
+    if deleted:
+        _platform_audit(
+            "delete_course",
+            target_type="course",
+            target_id=int(course_id),
+        )
 
 
 def copy_week(ws: date, weeks: int) -> int:
@@ -1614,6 +1644,12 @@ def page_targets() -> None:
                         st.error(f"这个学生还有 {int(used)} 节课程，请先删除或调整这些课程")
                     else:
                         run("DELETE FROM one_to_one_students WHERE id=?", (int(sid),))
+                        _platform_audit(
+                            "delete_student",
+                            target_type="student",
+                            target_id=int(sid),
+                            detail="one_to_one",
+                        )
                         st.rerun()
 
 
