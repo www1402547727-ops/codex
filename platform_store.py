@@ -109,6 +109,15 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             ON audit_logs(org_id, at);
         CREATE INDEX IF NOT EXISTS idx_audit_actor_time
             ON audit_logs(actor_role, at);
+        CREATE TABLE IF NOT EXISTS system_errors(
+            id INTEGER PRIMARY KEY,
+            at TEXT NOT NULL,
+            module TEXT NOT NULL DEFAULT '',
+            error_type TEXT NOT NULL DEFAULT '',
+            detail TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_system_errors_time
+            ON system_errors(at);
         """
     )
     # 兼容以后可能存在的旧版本表：只加字段，不删字段。
@@ -502,6 +511,58 @@ def list_audit(
                 FROM audit_logs{where}
                 ORDER BY id DESC LIMIT ?""",
             params,
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+# ==================== 系统错误（只记技术信息） ====================
+def record_system_error(
+    module: str,
+    error_type: str,
+    detail: str = "",
+    *,
+    at: str | None = None,
+) -> None:
+    """记录平台级系统错误。
+
+    只允许写模块、异常类型和简短技术说明，不写学生姓名、成绩或试卷内容。
+    """
+    with _lock:
+        conn = _connect()
+        try:
+            _init_schema(conn)
+            conn.execute(
+                """INSERT INTO system_errors(at, module, error_type, detail)
+                   VALUES(?,?,?,?)""",
+                (
+                    str(at or _now()),
+                    str(module or "")[:120],
+                    str(error_type or "")[:120],
+                    str(detail or "")[:500],
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        try:
+            _save()
+        except Exception as exc:
+            print(f"[platform_store] 保存系统错误失败：{exc}", file=sys.stderr)
+
+
+def list_system_errors(limit: int = 20) -> list[dict]:
+    path = platform_db_path()
+    if not path.is_file():
+        return []
+    conn = _connect(path)
+    try:
+        _init_schema(conn)
+        rows = conn.execute(
+            """SELECT at, module, error_type, detail
+               FROM system_errors ORDER BY id DESC LIMIT ?""",
+            (max(1, min(int(limit), 100)),),
         ).fetchall()
         return [dict(row) for row in rows]
     finally:

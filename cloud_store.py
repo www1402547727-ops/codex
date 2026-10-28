@@ -348,6 +348,111 @@ def upload_text(object_path: str, text: str) -> None:
     upload_object(object_path, str(text).encode("utf-8"), "application/json")
 
 
+def list_storage_objects(
+    prefix: str = "",
+    *,
+    page_size: int = 100,
+    max_items: int = 5000,
+) -> list[dict]:
+    """列出 Storage 某个前缀下的对象（单层）。
+
+    返回项包含 name / object_path / is_file / size / updated_at。
+    目录项的 is_file 为 False。分页只用于运营统计，不下载文件内容。
+    """
+    if not is_cloud():
+        return []
+    clean_prefix = str(prefix or "").strip().strip("/")
+    bucket = quote(_config["bucket"], safe="")
+    url = f"{_config['url']}/storage/v1/object/list/{bucket}"
+    offset = 0
+    result: list[dict] = []
+    while len(result) < max_items:
+        body = {
+            "prefix": clean_prefix,
+            "limit": max(1, min(int(page_size), 100)),
+            "offset": offset,
+            "sortBy": {"column": "name", "order": "asc"},
+        }
+        try:
+            response = requests.post(
+                url,
+                headers=_headers("application/json"),
+                json=body,
+                timeout=(15, 60),
+            )
+        except requests.RequestException as exc:
+            raise CloudStorageError(f"读取云端目录失败：{type(exc).__name__}") from exc
+        if not response.ok:
+            raise CloudStorageError(
+                f"读取云端目录失败：HTTP {response.status_code} {response.text[:160]}"
+            )
+        try:
+            rows = response.json()
+        except Exception as exc:
+            raise CloudStorageError("读取云端目录失败：返回内容不是列表") from exc
+        if not isinstance(rows, list):
+            raise CloudStorageError("读取云端目录失败：返回内容格式不正确")
+        if not rows:
+            break
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if not name:
+                continue
+            metadata = item.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+            try:
+                size = int(
+                    metadata.get("size")
+                    or metadata.get("contentLength")
+                    or item.get("size")
+                    or 0
+                )
+            except (TypeError, ValueError):
+                size = 0
+            result.append(
+                {
+                    "name": name,
+                    "object_path": (
+                        f"{clean_prefix}/{name}" if clean_prefix else name
+                    ),
+                    "is_file": item.get("id") is not None,
+                    "size": max(0, size),
+                    "updated_at": str(
+                        item.get("updated_at")
+                        or item.get("created_at")
+                        or ""
+                    ),
+                }
+            )
+            if len(result) >= max_items:
+                break
+        offset += len(rows)
+        if len(rows) < body["limit"]:
+            break
+    return result
+
+
+def photo_storage_prefix(slug: str | None = None) -> str:
+    """图片和 PDF 在 Storage 中的单层目录前缀。"""
+    if is_default_slug(slug):
+        return "photos"
+    return f"photos/{normalize_slug(slug)}"
+
+
+def storage_prefix_stats(prefix: str) -> dict:
+    """统计某个单层前缀下文件数量和字节数；目录本身不计入。"""
+    objects = list_storage_objects(prefix)
+    files = [item for item in objects if item.get("is_file")]
+    return {
+        "count": len(files),
+        "bytes": sum(int(item.get("size") or 0) for item in files),
+        "truncated": len(objects) >= 5000,
+    }
+
+
 def upload_photo(local_path: str | Path, filename: str, slug: str | None = None) -> None:
     upload_local_file(local_path, photo_object_path(filename, current_slug() if slug is None else slug))
 

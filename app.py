@@ -1944,6 +1944,7 @@ if user["role"] == um.ROLE_TEACHER:
     )
     if IS_ADMIN:
         PAGES["账号管理"] = um.page_user_admin
+        PAGES["平台概览"] = admin_console.page_platform_overview
         PAGES["总后台"] = admin_console.page_admin
     elif teacher_registry.get_setting(
         teacher_registry.SETTING_TEACHERS_CAN_CREATE_STUDENTS, False

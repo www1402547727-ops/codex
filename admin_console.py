@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import sqlite3
 import sys
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -33,14 +33,15 @@ def configure(init_schema) -> None:
     _init_schema = init_schema
 
 
-def _require_admin() -> str:
+def _require_admin(page_label: str = "总后台") -> str:
     user = um.current_user()
-    if user is None:
+    if user is None or user.get("role") != um.ROLE_TEACHER:
+        st.error(f"没有权限访问{page_label}")
         st.stop()
     slug = cloud_store.current_slug()
     entry = teacher_registry.teacher_entry(slug)
     if not entry or not bool(entry.get("is_admin")):
-        st.error("没有权限访问总后台")
+        st.error(f"没有权限访问{page_label}")
         st.stop()
     return slug
 
@@ -68,6 +69,267 @@ def _read(db: Path, sql: str, params=()) -> pd.DataFrame:
             conn.close()
     except Exception:
         return pd.DataFrame()
+
+
+# ==================== 平台运营概览 ====================
+# 平台概览只做运营数量统计，禁止在这里查询学生姓名、成绩、错题或试卷内容。
+_OVERVIEW_STUDENTS_SQL = "SELECT COUNT(*) FROM students"
+_OVERVIEW_PLANS_SQL = (
+    "SELECT COUNT(*) FROM plans WHERE plan_date>=? AND plan_date<=?"
+)
+_OVERVIEW_EXAMS_SQL = "SELECT COUNT(*) FROM exams"
+_OVERVIEW_LAST_LOGIN_SQL = (
+    "SELECT MAX(last_login) FROM users WHERE role='teacher'"
+)
+
+
+def _format_bytes(size: int | float | None) -> str:
+    value = max(0.0, float(size or 0))
+    units = ("B", "KB", "MB", "GB", "TB")
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(value)} B"
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return "0 B"
+
+
+def _max_time_text(values) -> str:
+    texts = [str(value or "").strip() for value in values if str(value or "").strip()]
+    return max(texts) if texts else ""
+
+
+def _display_time(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        when = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except Exception:
+        return text
+    return when.strftime("%Y-%m-%d %H:%M")
+
+
+def _overview_db_counts(db: Path, since: str, today: str) -> dict:
+    """只读统计一份老师库；不查询任何学生内容字段。"""
+    path = Path(db)
+    result = {
+        "students": 0,
+        "courses_30d": 0,
+        "exams": 0,
+        "last_login": "",
+        "db_bytes": path.stat().st_size if path.is_file() else 0,
+        "error": False,
+    }
+    if not path.is_file():
+        return result
+    try:
+        conn = sqlite3.connect(
+            path.resolve().as_uri() + "?mode=ro", uri=True, timeout=10
+        )
+    except Exception:
+        result["error"] = True
+        return result
+    try:
+        tables = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if "students" in tables:
+            result["students"] = int(
+                conn.execute(_OVERVIEW_STUDENTS_SQL).fetchone()[0] or 0
+            )
+        if "plans" in tables:
+            result["courses_30d"] = int(
+                conn.execute(_OVERVIEW_PLANS_SQL, (since, today)).fetchone()[0] or 0
+            )
+        if "exams" in tables:
+            result["exams"] = int(
+                conn.execute(_OVERVIEW_EXAMS_SQL).fetchone()[0] or 0
+            )
+        if "users" in tables:
+            result["last_login"] = str(
+                conn.execute(_OVERVIEW_LAST_LOGIN_SQL).fetchone()[0] or ""
+            )
+    except Exception:
+        result["error"] = True
+    finally:
+        conn.close()
+    return result
+
+
+def _overview_media_stats(slug: str) -> dict:
+    """统计某位老师图片/PDF 数量与估算大小，不返回文件名。"""
+    if cloud_store.is_cloud():
+        return cloud_store.storage_prefix_stats(cloud_store.photo_storage_prefix(slug))
+    photos = cloud_store.get_data_dir(teacher_registry.base_dir(), slug) / "photos"
+    if not photos.is_dir():
+        return {"count": 0, "bytes": 0}
+    files = [path for path in photos.rglob("*") if path.is_file()]
+    return {
+        "count": len(files),
+        "bytes": sum(path.stat().st_size for path in files),
+    }
+
+
+def build_platform_overview(
+    *,
+    db_resolver=None,
+    media_resolver=None,
+    today: date | None = None,
+) -> list[dict]:
+    """按机构汇总运营数据。
+
+    db_resolver / media_resolver 仅用于测试时注入假数据；生产环境默认读取
+    各老师自己的库和对应图片目录。返回值不包含学生姓名、成绩或试卷内容。
+    """
+    organizations = platform_store.list_organizations()
+    if not organizations:
+        return []
+    db_resolver = db_resolver or _teacher_db
+    media_resolver = media_resolver or _overview_media_stats
+    current = today or date.today()
+    since = (current - timedelta(days=29)).isoformat()
+    today_text = current.isoformat()
+
+    rows: list[dict] = []
+    for org in organizations:
+        org_id = int(org["id"])
+        members = platform_store.list_org_users(org_id)
+        total_students = 0
+        total_courses = 0
+        total_exams = 0
+        total_db_bytes = 0
+        total_media = 0
+        total_media_bytes = 0
+        last_logins: list[str] = []
+        read_error = False
+        media_error = False
+
+        for member in members:
+            slug = cloud_store.normalize_slug(member.get("slug")) or cloud_store.DEFAULT_SLUG
+            try:
+                db = db_resolver(slug)
+                counts = _overview_db_counts(db, since, today_text)
+            except Exception:
+                counts = {
+                    "students": 0,
+                    "courses_30d": 0,
+                    "exams": 0,
+                    "last_login": "",
+                    "db_bytes": 0,
+                    "error": True,
+                }
+            total_students += int(counts["students"])
+            total_courses += int(counts["courses_30d"])
+            total_exams += int(counts["exams"])
+            total_db_bytes += int(counts["db_bytes"])
+            read_error = read_error or bool(counts["error"])
+            if counts["last_login"]:
+                last_logins.append(str(counts["last_login"]))
+
+            try:
+                media = media_resolver(slug)
+                total_media += int(media.get("count") or 0)
+                total_media_bytes += int(media.get("bytes") or 0)
+            except Exception:
+                media_error = True
+
+        rows.append(
+            {
+                "org_id": org_id,
+                "name": str(org.get("name") or ""),
+                "kind": str(org.get("kind") or "机构"),
+                "status": str(org.get("status") or ""),
+                "teacher_count": len(members),
+                "student_count": total_students,
+                "course_count_30d": total_courses,
+                "exam_count": total_exams,
+                "last_login": _max_time_text(last_logins),
+                "media_count": None if media_error else total_media,
+                "media_bytes": total_media_bytes,
+                "created_at": str(org.get("created_at") or ""),
+                "read_error": read_error,
+                "media_error": media_error,
+                "_db_bytes": total_db_bytes,
+            }
+        )
+    return rows
+
+
+def _latest_local_backup() -> str:
+    roots = [
+        teacher_registry.base_dir() / "backups",
+        Path(__file__).parent / "backups",
+    ]
+    files: list[Path] = []
+    for root in roots:
+        if root.is_dir():
+            files.extend(path for path in root.rglob("*") if path.is_file())
+    if not files:
+        return ""
+    latest = max(files, key=lambda path: path.stat().st_mtime)
+    return datetime.fromtimestamp(latest.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+
+
+def _collect_cloud_files(prefix: str, max_depth: int = 2) -> list[dict]:
+    files: list[dict] = []
+    queue: list[tuple[str, int]] = [(prefix, 0)]
+    while queue:
+        current, depth = queue.pop(0)
+        for item in cloud_store.list_storage_objects(current):
+            if item.get("is_file"):
+                files.append(item)
+            elif depth < max_depth:
+                queue.append((str(item.get("object_path") or ""), depth + 1))
+    return files
+
+
+def latest_backup_at() -> str:
+    """返回最近一次备份时间；本地和云端都查不到时返回空字符串。"""
+    if not cloud_store.is_cloud():
+        return _latest_local_backup()
+    try:
+        roots = cloud_store.list_storage_objects("backups")
+        date_folders = sorted(
+            [
+                item
+                for item in roots
+                if not item.get("is_file")
+                and len(str(item.get("name") or "")) >= 10
+                and str(item.get("name") or "")[:4].isdigit()
+            ],
+            key=lambda item: str(item.get("name") or ""),
+            reverse=True,
+        )
+        direct_files = [item for item in roots if item.get("is_file")]
+        for folder in date_folders[:14]:
+            files = _collect_cloud_files(str(folder.get("object_path") or ""))
+            if files:
+                return _display_time(
+                    _max_time_text(item.get("updated_at") for item in files)
+                )
+        if direct_files:
+            return _display_time(
+                _max_time_text(item.get("updated_at") for item in direct_files)
+            )
+    except Exception:
+        return ""
+    return ""
+
+
+def _database_size_bytes(rows: list[dict]) -> int:
+    total = sum(int(row.get("_db_bytes") or 0) for row in rows)
+    try:
+        platform_db = platform_store.platform_db_path()
+        if platform_db.is_file():
+            total += platform_db.stat().st_size
+    except Exception:
+        pass
+    return total
 
 
 def _ago(value: str) -> str:
@@ -685,6 +947,87 @@ def create_student_account(
 
 
 # ==================== 页面 ====================
+def page_platform_overview() -> None:
+    """平台管理员专用的运营概览，不展示任何学生内容。"""
+    _require_admin("平台概览")
+    st.title("平台概览")
+    st.caption(
+        "这里只显示机构、账号数量和存储情况，不显示学生姓名、成绩或试卷内容。"
+    )
+
+    rows = build_platform_overview()
+    if not rows:
+        st.info("还没有机构记录。")
+        return
+
+    total_teachers = sum(int(row["teacher_count"]) for row in rows)
+    total_students = sum(int(row["student_count"]) for row in rows)
+    total_courses = sum(int(row["course_count_30d"]) for row in rows)
+    total_exams = sum(int(row["exam_count"]) for row in rows)
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("机构", len(rows))
+    m2.metric("老师", total_teachers)
+    m3.metric("学生", total_students)
+    m4.metric("近 30 天课程", total_courses)
+    m5.metric("考试", total_exams)
+
+    table = pd.DataFrame(
+        [
+            {
+                "机构": row["name"],
+                "类型": row["kind"],
+                "状态": row["status"],
+                "老师数": row["teacher_count"],
+                "学生数": row["student_count"],
+                "近30天课程": row["course_count_30d"],
+                "考试数": row["exam_count"],
+                "最近登录": _ago(row["last_login"]),
+                "照片/PDF": (
+                    "暂时无法统计"
+                    if row["media_count"] is None
+                    else f"{row['media_count']} 个 · {_format_bytes(row['media_bytes'])}"
+                ),
+                "创建时间": row["created_at"] or "—",
+                "读取状态": (
+                    "部分统计暂不可用"
+                    if row["read_error"] or row["media_error"]
+                    else "正常"
+                ),
+            }
+            for row in rows
+        ]
+    )
+    st.dataframe(table, hide_index=True, use_container_width=True)
+
+    st.divider()
+    st.subheader("存储与运行")
+    s1, s2 = st.columns(2)
+    s1.metric("数据库大小", _format_bytes(_database_size_bytes(rows)))
+    s2.metric("最近一次备份", latest_backup_at() or "暂无备份记录")
+
+    with st.expander("最近 20 条系统错误", expanded=False):
+        st.caption("系统错误只记录模块、异常类型和简短技术说明，不包含学生内容。")
+        try:
+            errors = platform_store.list_system_errors(20)
+        except Exception:
+            errors = []
+        if not errors:
+            st.info("暂无系统错误记录。")
+        else:
+            error_table = pd.DataFrame(
+                [
+                    {
+                        "时间": row.get("at") or "—",
+                        "模块": row.get("module") or "—",
+                        "类型": row.get("error_type") or "—",
+                        "说明": row.get("detail") or "—",
+                    }
+                    for row in errors
+                ]
+            )
+            st.dataframe(error_table, hide_index=True, use_container_width=True)
+
+
 def page_admin() -> None:
     my_slug = _require_admin()
     st.title("总后台")
