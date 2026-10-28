@@ -4,6 +4,7 @@ import hashlib
 import mimetypes
 import os
 import re
+import shutil
 import sqlite3
 import tempfile
 import threading
@@ -483,11 +484,11 @@ def delete_storage_objects(object_paths: list[str]) -> int:
             )
         except requests.RequestException as exc:
             raise CloudStorageError(
-                f"删除过期备份失败：{type(exc).__name__}"
+                f"删除云端文件失败：{type(exc).__name__}"
             ) from exc
         if not response.ok:
             raise CloudStorageError(
-                f"删除过期备份失败：HTTP {response.status_code} "
+                f"删除云端文件失败：HTTP {response.status_code} "
                 f"{response.text[:160]}"
             )
     return len(cleaned)
@@ -535,6 +536,111 @@ def storage_prefix_stats(prefix: str) -> dict:
         "bytes": sum(int(item.get("size") or 0) for item in files),
         "truncated": len(objects) >= 5000,
     }
+
+
+def _teacher_storage_files(slug: str | None = None) -> list[str]:
+    """列出某位老师自己的数据库、照片和备份文件，不包含其他老师。"""
+    if not is_cloud():
+        return []
+    target = normalize_slug(slug) or DEFAULT_SLUG
+    paths: list[str] = [db_object_path(target)]
+
+    if is_default_slug(target):
+        # 老数据的照片直接放在 photos/ 根目录。只取文件，绝不能把
+        # photos/ 当成前缀递归删除，否则会连带删掉其他老师的子目录。
+        photo_items = list_storage_objects("photos")
+        paths.extend(
+            str(item.get("object_path") or "")
+            for item in photo_items
+            if item.get("is_file")
+        )
+    else:
+        photo_items = list_storage_objects(f"photos/{target}")
+        paths.extend(
+            str(item.get("object_path") or "")
+            for item in photo_items
+            if item.get("is_file")
+        )
+
+    for date_item in list_storage_objects("backups"):
+        if date_item.get("is_file"):
+            continue
+        date_name = str(date_item.get("name") or "").strip()
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_name):
+            continue
+        if is_default_slug(target):
+            backup_prefix = f"backups/{date_name}"
+            backup_items = list_storage_objects(backup_prefix)
+            paths.extend(
+                str(item.get("object_path") or "")
+                for item in backup_items
+                if item.get("is_file") and str(item.get("name") or "") == "scores.db"
+            )
+        else:
+            backup_prefix = f"backups/{date_name}/{target}"
+            backup_items = list_storage_objects(backup_prefix)
+            paths.extend(
+                str(item.get("object_path") or "")
+                for item in backup_items
+                if item.get("is_file")
+            )
+
+    return sorted({path.strip("/") for path in paths if str(path or "").strip()})
+
+
+def delete_teacher_storage(slug: str | None = None) -> int:
+    """删除一位老师在云端的数据库、照片和全部历史备份。"""
+    target = normalize_slug(slug) or DEFAULT_SLUG
+    paths = _teacher_storage_files(target)
+    deleted = delete_storage_objects(paths)
+    object_path = db_object_path(target)
+    _prepared.discard(object_path)
+    _remote_db_missing.pop(object_path, None)
+    _last_backup_date.pop(object_path, None)
+    _last_uploaded_digest.pop(object_path, None)
+    return deleted
+
+
+def _remove_default_local_files(root: Path) -> None:
+    """只清理老数据自己的文件，不删除数据根目录、名册或平台库。"""
+    db = root / "scores.db"
+    db.unlink(missing_ok=True)
+    photos = root / "photos"
+    if photos.is_dir():
+        for path in photos.iterdir():
+            if path.is_file():
+                path.unlink(missing_ok=True)
+    backups = root / "backups"
+    if backups.is_dir():
+        for path in backups.glob("*/scores.db"):
+            if path.is_file():
+                path.unlink(missing_ok=True)
+
+
+def remove_local_teacher_data(
+    base_dir: str | Path, slug: str | None = None
+) -> None:
+    """清理本项目或云端临时目录里属于某位老师的本地缓存。
+
+    老数据目录同时放着 teachers.json/platform.db，所以 default 只删业务库、
+    直接位于 photos/ 下的照片和 scores.db 备份，绝不整目录删除。
+    """
+    target = normalize_slug(slug) or DEFAULT_SLUG
+    roots = [Path(base_dir)]
+    if is_cloud():
+        roots.append(Path(tempfile.gettempdir()) / "score_tracker_cloud_data")
+
+    for root in roots:
+        root = root.resolve()
+        if is_default_slug(target):
+            _remove_default_local_files(root)
+            continue
+        teachers_dir = (root / "teachers").resolve()
+        target_dir = (teachers_dir / target).resolve()
+        if target_dir.parent != teachers_dir:
+            raise ValueError("老师数据目录不合法")
+        if target_dir.is_dir():
+            shutil.rmtree(target_dir)
 
 
 def upload_photo(local_path: str | Path, filename: str, slug: str | None = None) -> None:

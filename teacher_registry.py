@@ -387,6 +387,36 @@ def update_teacher(slug: str, **changes) -> None:
         save(roster, strict=True)
 
 
+def remove_teachers(slugs: list[str]) -> int:
+    """从名册中彻底移除若干老师及其登录名映射，返回移除数量。"""
+    targets = {
+        cloud_store.normalize_slug(slug) or DEFAULT_SLUG
+        for slug in (slugs or [])
+        if str(slug or "").strip()
+    }
+    if not targets:
+        return 0
+    with _lock:
+        roster = load()
+        before = len(roster.get("teachers", []))
+        roster["teachers"] = [
+            item
+            for item in roster.get("teachers", [])
+            if (cloud_store.normalize_slug(item.get("slug")) or DEFAULT_SLUG)
+            not in targets
+        ]
+        mapping = roster.get("usernames", {})
+        roster["usernames"] = {
+            name: slug
+            for name, slug in mapping.items()
+            if (cloud_store.normalize_slug(slug) or DEFAULT_SLUG) not in targets
+        }
+        removed = before - len(roster["teachers"])
+        if removed or roster["usernames"] != mapping:
+            save(roster, strict=True)
+        return removed
+
+
 def compute_stats(db_path: str | Path) -> dict:
     """算一位老师的汇总（学生数、本月课时等）。只读，不改动原库。"""
     path = Path(db_path)

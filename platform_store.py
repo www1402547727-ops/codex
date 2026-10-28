@@ -504,6 +504,33 @@ def add_org_user(org_id: int, slug: str, role: str = ROLE_TEACHER) -> tuple[bool
         return True, ""
 
 
+def delete_organization_record(org_id: int) -> bool:
+    """删除机构及其成员关系；审计日志保留，不在这里删除。"""
+    with _lock:
+        conn = _connect()
+        try:
+            _init_schema(conn)
+            exists = conn.execute(
+                "SELECT 1 FROM organizations WHERE id=? LIMIT 1",
+                (int(org_id),),
+            ).fetchone()
+            if exists is None:
+                return False
+            conn.execute(
+                "DELETE FROM org_user_roles WHERE org_id=?",
+                (int(org_id),),
+            )
+            conn.execute(
+                "DELETE FROM organizations WHERE id=?",
+                (int(org_id),),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        _save()
+        return True
+
+
 def is_org_admin(slug: str | None, org_id: int | None = None) -> bool:
     row = org_user_for_slug(slug)
     if not row or row.get("role") != ROLE_ORG_ADMIN:

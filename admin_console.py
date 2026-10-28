@@ -10,8 +10,12 @@
 
 from __future__ import annotations
 
+import csv
+import io
+import re
 import sqlite3
 import sys
+import zipfile
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -371,6 +375,259 @@ def _record_platform_audit(
         )
     except Exception as exc:
         print(f"[admin_console] 写平台审计失败：{exc}", file=sys.stderr)
+
+
+def _csv_bytes(headers: list[str], rows: list[list[object]]) -> bytes:
+    buffer = io.StringIO(newline="")
+    writer = csv.writer(buffer)
+    writer.writerow(headers)
+    for row in rows:
+        writer.writerow(["" if value is None else value for value in row])
+    return buffer.getvalue().encode("utf-8-sig")
+
+
+def _archive_part(value: object, fallback: str = "未命名") -> str:
+    text = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", str(value or "")).strip(" ._")
+    return text[:100] or fallback
+
+
+def _teacher_photo_files(slug: str) -> list[tuple[str, bytes]]:
+    """读取一位老师自己的照片/PDF；不读取其他老师目录。"""
+    target = cloud_store.normalize_slug(slug) or cloud_store.DEFAULT_SLUG
+    if cloud_store.is_cloud():
+        if cloud_store.is_default_slug(target):
+            items = cloud_store.list_storage_objects("photos")
+            files = [item for item in items if item.get("is_file")]
+        else:
+            items = cloud_store.list_storage_objects(f"photos/{target}")
+            files = [item for item in items if item.get("is_file")]
+        result: list[tuple[str, bytes]] = []
+        for item in files:
+            name = cloud_store.safe_media_name(item.get("name"))
+            object_path = str(item.get("object_path") or "").strip("/")
+            data = cloud_store.download_object(object_path)
+            if data is not None:
+                result.append((name, data))
+        return result
+
+    photos = cloud_store.get_data_dir(
+        teacher_registry.base_dir(), target
+    ) / "photos"
+    if not photos.is_dir():
+        return []
+    result = []
+    for path in sorted(photos.iterdir()):
+        if not path.is_file():
+            continue
+        name = cloud_store.safe_media_name(path.name)
+        result.append((name, path.read_bytes()))
+    return result
+
+
+def export_organization_zip(
+    org_id: int,
+    *,
+    actor_slug: str,
+    include_photos: bool = False,
+    db_resolver=None,
+    photo_loader=None,
+) -> bytes:
+    """导出本机构全部老师的数据；调用者必须是该机构的机构管理员。"""
+    org = platform_store.get_organization(int(org_id))
+    if org is None:
+        raise ValueError("机构不存在")
+    actor = platform_store.org_user_for_slug(actor_slug)
+    if (
+        actor is None
+        or int(actor.get("org_id") or 0) != int(org_id)
+        or actor.get("role") != platform_store.ROLE_ORG_ADMIN
+    ):
+        raise PermissionError("只能导出自己所属机构的数据")
+
+    members = platform_store.list_org_users(int(org_id))
+    if any(int(member.get("org_id") or 0) != int(org_id) for member in members):
+        raise PermissionError("机构成员数据不完整，已停止导出")
+    db_resolver = db_resolver or _teacher_db
+    photo_loader = photo_loader or _teacher_photo_files
+
+    teacher_rows: list[list[object]] = []
+    for member in members:
+        slug = cloud_store.normalize_slug(member.get("slug")) or cloud_store.DEFAULT_SLUG
+        entry = teacher_registry.teacher_entry(slug) or {}
+        teacher_rows.append(
+            [
+                slug,
+                platform_store.ROLE_LABELS.get(
+                    str(member.get("role") or ""), str(member.get("role") or "")
+                ),
+                entry.get("username") or "",
+                entry.get("display_name") or "",
+                "启用" if bool(entry.get("active", True)) else "停用",
+            ]
+        )
+
+    buffer = io.BytesIO()
+    photo_manifest: list[list[object]] = []
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "导出说明.txt",
+            (
+                "本压缩包由教务工作台导出。\n"
+                "每位老师的数据库表分别保存在「老师/<标识>/」目录下，每张表一个 CSV。\n"
+                "CSV 使用 UTF-8 编码，可直接用常见表格软件打开。\n"
+                "如导出时勾选照片，文件保存在「照片/<标识>/」目录下。\n"
+            ),
+        )
+        archive.writestr(
+            "机构信息.csv",
+            _csv_bytes(
+                ["机构ID", "机构名称", "类型", "状态", "创建时间", "备注"],
+                [
+                    [
+                        org.get("id"),
+                        org.get("name"),
+                        org.get("kind"),
+                        org.get("status"),
+                        org.get("created_at"),
+                        org.get("note"),
+                    ]
+                ],
+            ),
+        )
+        archive.writestr(
+            "老师清单.csv",
+            _csv_bytes(
+                ["老师标识", "机构权限", "登录账号", "显示名", "账号状态"],
+                teacher_rows,
+            ),
+        )
+
+        for member in members:
+            slug = cloud_store.normalize_slug(member.get("slug")) or cloud_store.DEFAULT_SLUG
+            db = Path(db_resolver(slug))
+            if not db.is_file():
+                raise FileNotFoundError(f"找不到老师 {slug} 的数据库")
+            conn = sqlite3.connect(
+                db.resolve().as_uri() + "?mode=ro", uri=True, timeout=15
+            )
+            try:
+                tables = [
+                    str(row[0])
+                    for row in conn.execute(
+                        """SELECT name FROM sqlite_master
+                           WHERE type='table' AND name NOT LIKE 'sqlite_%'
+                           ORDER BY name"""
+                    ).fetchall()
+                ]
+                for table in tables:
+                    safe_table = _archive_part(table, "table")
+                    quoted = table.replace('"', '""')
+                    cursor = conn.execute(f'SELECT * FROM "{quoted}"')
+                    headers = [
+                        str(description[0]) for description in cursor.description or []
+                    ]
+                    rows = [list(row) for row in cursor.fetchall()]
+                    sensitive = {
+                        index
+                        for index, header in enumerate(headers)
+                        if header.lower() in {"password", "password_hash"}
+                    }
+                    if sensitive:
+                        rows = [
+                            [
+                                "[已隐藏]"
+                                if index in sensitive
+                                else value
+                                for index, value in enumerate(row)
+                            ]
+                            for row in rows
+                        ]
+                    archive.writestr(
+                        f"老师/{slug}/{safe_table}.csv",
+                        _csv_bytes(headers, rows),
+                    )
+            finally:
+                conn.close()
+
+            if include_photos:
+                for name, data in photo_loader(slug):
+                    safe_name = cloud_store.safe_media_name(name)
+                    archive.writestr(f"照片/{slug}/{safe_name}", data)
+                    photo_manifest.append([slug, safe_name, len(data)])
+
+        if include_photos:
+            archive.writestr(
+                "照片清单.csv",
+                _csv_bytes(["老师标识", "文件名", "字节数"], photo_manifest),
+            )
+
+    _record_platform_audit(
+        "export",
+        target_type="organization",
+        target_id=int(org_id),
+        detail=f"teachers={len(members)};photos={1 if include_photos else 0}",
+        org_id=int(org_id),
+    )
+    return buffer.getvalue()
+
+
+def delete_organization(
+    org_id: int,
+    confirmation_name: str,
+    *,
+    actor_slug: str,
+) -> tuple[bool, str]:
+    """平台管理员彻底删除一个机构及其全部老师和云端数据。"""
+    if platform_store.is_impersonating():
+        return False, "代入查看期间不能删除机构"
+    actor = teacher_registry.teacher_entry(actor_slug) or {}
+    if not bool(actor.get("is_admin")):
+        return False, "只有平台管理员可以删除机构"
+    org = platform_store.get_organization(int(org_id))
+    if org is None:
+        return False, "机构不存在"
+    expected = str(org.get("name") or "").strip()
+    if str(confirmation_name or "").strip() != expected:
+        return False, "机构名称输入不一致，已停止删除"
+
+    members = platform_store.list_org_users(int(org_id))
+    if any(int(member.get("org_id") or 0) != int(org_id) for member in members):
+        return False, "机构成员数据不完整，已停止删除"
+    slugs = [
+        cloud_store.normalize_slug(member.get("slug")) or cloud_store.DEFAULT_SLUG
+        for member in members
+    ]
+    protected = [
+        slug
+        for slug in slugs
+        if bool((teacher_registry.teacher_entry(slug) or {}).get("is_admin"))
+    ]
+    if protected:
+        return False, "这个机构里有平台管理员账号，不能删除"
+
+    deleted_objects = 0
+    for slug in slugs:
+        try:
+            deleted_objects += cloud_store.delete_teacher_storage(slug)
+            cloud_store.remove_local_teacher_data(teacher_registry.base_dir(), slug)
+        except Exception as exc:
+            return False, f"清理机构数据失败，请稍后重试：{exc}"
+
+    try:
+        teacher_registry.remove_teachers(slugs)
+    except Exception as exc:
+        return False, f"清理老师名册失败，请稍后重试：{exc}"
+    if not platform_store.delete_organization_record(int(org_id)):
+        return False, "机构记录已经不存在，请刷新页面确认"
+
+    _record_platform_audit(
+        "delete_organization",
+        target_type="organization",
+        target_id=int(org_id),
+        detail=f"teachers={len(slugs)};objects={deleted_objects}",
+        org_id=int(org_id),
+    )
+    return True, ""
 
 
 def _render_platform_access_log(org_id: int) -> None:
@@ -797,7 +1054,9 @@ def page_org_admin() -> None:
         f"{org.get('name') or '未命名机构'} · {org.get('kind') or '机构'} · "
         f"{org.get('status') or '体验'}"
     )
-    st.caption("这里只能管理本机构的老师账号，看不到其他机构，也看不到学生成绩。")
+    st.caption(
+        "这里只能管理本机构的老师账号和导出本机构数据，不能查看或导出其他机构。"
+    )
 
     created = st.session_state.pop("org_teacher_created", None)
     reset = st.session_state.pop("org_teacher_reset", None)
@@ -814,6 +1073,49 @@ def page_org_admin() -> None:
             f"登录账号：{reset['username']}\n新密码：{reset['password']}",
             language=None,
         )
+
+    with st.expander("导出本机构全部数据", expanded=False):
+        st.caption(
+            "导出范围只包含本机构老师。每位老师的每张数据表会生成一个 CSV，"
+            "照片和 PDF 可选。"
+        )
+        include_photos = st.checkbox(
+            "同时导出照片和 PDF（文件可能较多，生成会慢一些）",
+            key=f"org_export_photos_{org_id}",
+        )
+        if st.button(
+            "生成机构数据压缩包",
+            type="primary",
+            use_container_width=True,
+            key=f"org_export_button_{org_id}",
+        ):
+            try:
+                with st.spinner("正在整理本机构数据..."):
+                    data = export_organization_zip(
+                        org_id,
+                        actor_slug=my_slug,
+                        include_photos=bool(include_photos),
+                    )
+                st.session_state[f"org_export_ready_{org_id}"] = {
+                    "data": data,
+                    "name": (
+                        f"{_archive_part(org.get('name'), '机构')}"
+                        f"_导出_{date.today().isoformat()}.zip"
+                    ),
+                }
+            except Exception as exc:
+                st.error(f"导出失败：{exc}")
+        ready = st.session_state.get(f"org_export_ready_{org_id}")
+        if isinstance(ready, dict) and ready.get("data"):
+            st.success("压缩包已经生成，点下面按钮保存到电脑或手机。")
+            st.download_button(
+                "下载机构数据压缩包",
+                data=ready["data"],
+                file_name=ready["name"],
+                mime="application/zip",
+                use_container_width=True,
+                key=f"org_export_download_{org_id}",
+            )
 
     with st.expander("＋ 开通本机构老师", expanded=False):
         with st.form("org_new_teacher"):
@@ -1199,6 +1501,60 @@ def page_admin() -> None:
                 language=None,
             )
             st.caption("机构管理员首次登录会被要求修改密码。")
+
+    with st.expander("危险操作：删除机构及全部数据", expanded=False):
+        st.warning(
+            "删除后不可恢复。会同时清除该机构的老师、学生数据、课程、成绩、"
+            "照片、数据库备份和登录账号。删除前请先导出备份。"
+        )
+        admin_slugs = {
+            cloud_store.normalize_slug(item.get("slug")) or cloud_store.DEFAULT_SLUG
+            for item in teacher_registry.list_teachers()
+            if bool(item.get("is_admin"))
+        }
+        for org in organizations:
+            org_id = int(org["id"])
+            members = platform_store.list_org_users(org_id)
+            member_slugs = {
+                cloud_store.normalize_slug(item.get("slug"))
+                or cloud_store.DEFAULT_SLUG
+                for item in members
+            }
+            protected = bool(member_slugs & admin_slugs)
+            with st.container(border=True):
+                st.markdown(f"**{org.get('name') or '未命名机构'}**")
+                if protected:
+                    st.caption("包含平台管理员账号，禁止删除。")
+                    continue
+                st.caption(
+                    f"将删除 {len(members)} 位老师及其全部业务数据。"
+                    f"请输入机构名称「{org.get('name') or ''}」确认。"
+                )
+                with st.form(f"delete_org_{org_id}"):
+                    confirm_name = st.text_input(
+                        "输入机构名称",
+                        key=f"delete_org_name_{org_id}",
+                    )
+                    confirmed = st.form_submit_button(
+                        "永久删除这个机构",
+                        type="primary",
+                    )
+                if confirmed:
+                    ok, err = delete_organization(
+                        org_id,
+                        confirm_name,
+                        actor_slug=my_slug,
+                    )
+                    if ok:
+                        st.session_state["admin_org_deleted"] = str(
+                            org.get("name") or ""
+                        )
+                        st.rerun()
+                    else:
+                        st.error(err)
+        deleted_org = st.session_state.pop("admin_org_deleted", None)
+        if deleted_org:
+            st.success(f"机构「{deleted_org}」及其全部数据已删除。")
 
     st.divider()
 
