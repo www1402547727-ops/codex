@@ -8,7 +8,7 @@ import sqlite3
 import tempfile
 import threading
 import time
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from urllib.parse import quote
 
@@ -31,6 +31,7 @@ _last_uploaded_digest: dict[str, str] = {}
 # 当前会话该用哪份库。真正的隔离靠 st.session_state(按会话),这里只是兜底。
 _session_slug = ""
 _UPLOAD_RETRIES = 3   # 上传遇到网络抖动/5xx 时的重试次数
+BACKUP_RETENTION_DAYS = 30
 
 # 老数据(单老师时期)的库标识。空值和 default 都指向原来那份库,保证老数据零迁移。
 DEFAULT_SLUG = "default"
@@ -334,6 +335,11 @@ def save_database(db_path: str | Path, object_path: str | None = None) -> None:
                 if download_object(backup) is None:
                     upload_object(backup, data, "application/vnd.sqlite3")
                 _last_backup_date[object_path] = today
+                # 当天备份成功后再清理过期目录；清理失败绝不能影响正常保存。
+                try:
+                    cleanup_old_backups(today=date.fromisoformat(today))
+                except Exception as exc:
+                    print(f"[cloud_store] 清理过期备份失败：{exc}", file=sys.stderr)
             except Exception:
                 pass  # 下次保存时再试
         if _last_uploaded_digest.get(object_path) != digest:
@@ -441,6 +447,76 @@ def list_storage_objects(
         if len(rows) < body["limit"]:
             break
     return result
+
+
+def delete_storage_objects(object_paths: list[str]) -> int:
+    """按前缀批量删除 Storage 对象；返回提交的前缀数量。
+
+    Supabase Storage 的批量删除接口接收 {"prefixes": [...]}。目录本身在
+    Storage 中不是独立对象，传入日期目录前缀即可删除该目录下的备份文件。
+    """
+    if not is_cloud():
+        return 0
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for value in object_paths or []:
+        path = str(value or "").strip().strip("/")
+        if not path or path in seen:
+            continue
+        if path.startswith("../") or "/../" in path or "\x00" in path:
+            raise ValueError("备份路径不合法")
+        seen.add(path)
+        cleaned.append(path)
+    if not cleaned:
+        return 0
+
+    bucket = quote(_config["bucket"], safe="")
+    url = f"{_config['url']}/storage/v1/object/{bucket}"
+    for offset in range(0, len(cleaned), 100):
+        chunk = cleaned[offset : offset + 100]
+        try:
+            response = requests.delete(
+                url,
+                headers=_headers("application/json"),
+                json={"prefixes": chunk},
+                timeout=(15, 120),
+            )
+        except requests.RequestException as exc:
+            raise CloudStorageError(
+                f"删除过期备份失败：{type(exc).__name__}"
+            ) from exc
+        if not response.ok:
+            raise CloudStorageError(
+                f"删除过期备份失败：HTTP {response.status_code} "
+                f"{response.text[:160]}"
+            )
+    return len(cleaned)
+
+
+def cleanup_old_backups(*, today: date | None = None) -> list[str]:
+    """删除超过保留期的 backups/YYYY-MM-DD 目录，返回已提交的目录前缀。"""
+    if not is_cloud():
+        return []
+    current = today or date.today()
+    cutoff = current - timedelta(days=BACKUP_RETENTION_DAYS)
+    stale: list[str] = []
+    for item in list_storage_objects("backups"):
+        if item.get("is_file"):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", name):
+            continue
+        try:
+            folder_day = date.fromisoformat(name)
+        except ValueError:
+            continue
+        # 保留含今天在内的 31 个自然日，更早的才删除。
+        if folder_day < cutoff:
+            path = str(item.get("object_path") or f"backups/{name}").strip("/")
+            if path:
+                stale.append(path)
+    delete_storage_objects(stale)
+    return stale
 
 
 def photo_storage_prefix(slug: str | None = None) -> str:
