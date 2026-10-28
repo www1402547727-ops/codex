@@ -1,6 +1,7 @@
 import os
 import re
 import sqlite3
+import sys
 import uuid
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -142,22 +143,31 @@ def _clean(params):
 
 
 def run(sql, params=()):
-    conn = sqlite3.connect(DB)
+    conn = sqlite3.connect(_session_db_path())
     try:
         cur = conn.execute(sql, _clean(params))
         conn.commit()
-        cloud_store.save_database(DB)
+        cloud_store.save_database(_session_db_path())
         return cur.lastrowid
     finally:
         conn.close()
 
 
 def query(sql, params=()):
-    conn = sqlite3.connect(DB)
+    conn = sqlite3.connect(_session_db_path())
     try:
         return pd.read_sql_query(sql, conn, params=_clean(params))
     finally:
         conn.close()
+
+
+def _session_db_path() -> Path:
+    """当前会话的数据库路径；避免 app.py 模块级 DB 在会话交替时串库。"""
+    return cloud_store.session_db_path(DB)
+
+
+def _session_photos_dir() -> Path:
+    return cloud_store.session_photos_dir(DB)
 
 
 SCHEMA = """
@@ -232,7 +242,7 @@ def init_db(db_path=None, object_path=None):
     传入 db_path / object_path 时作用在指定库上（总后台给新老师建库要用）。
     不传则作用在当前会话的库上。
     """
-    target = db_path or DB
+    target = db_path or _session_db_path()
     conn = sqlite3.connect(target)
     conn.executescript(SCHEMA)
     for table, cols in ADD_COLS.items():
@@ -331,17 +341,18 @@ def week_start(d):
 
 def save_photos(files, tag):
     names = []
+    photos_dir = _session_photos_dir()
     for f in files or []:
         suffix = Path(getattr(f, "name", "upload")).suffix.lower()
         if suffix == ".pdf":
             name = f"{tag}_{uuid.uuid4().hex[:8]}.pdf"
-            target = PHOTOS / name
+            target = photos_dir / name
             target.write_bytes(f.getbuffer())
         else:
             img = ImageOps.exif_transpose(Image.open(f)).convert("RGB")
             img.thumbnail((2000, 2000))
             name = f"{tag}_{uuid.uuid4().hex[:8]}.jpg"
-            target = PHOTOS / name
+            target = photos_dir / name
             img.save(target, quality=80, optimize=True)
         cloud_store.upload_photo(target, name)
         names.append(name)
@@ -350,7 +361,12 @@ def save_photos(files, tag):
 
 def show_photos(joined, caption):
     for n in [x for x in (joined or "").split("|") if x]:
-        path = cloud_store.ensure_local_photo(n, PHOTOS)
+        try:
+            path = cloud_store.ensure_local_photo(n, _session_photos_dir())
+        except Exception as exc:
+            st.warning(f"{caption}暂时加载失败，请刷新页面重试。")
+            print(f"[teacher_media] 加载{caption}失败：{n}：{exc}", file=sys.stderr)
+            continue
         if not path.exists():
             continue
         if path.suffix.lower() == ".pdf":

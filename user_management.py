@@ -88,9 +88,76 @@ def _photos_dir() -> Path:
         return Path("data") / "photos"
 
 
-def _show_media(joined, caption: str = "") -> None:
+def _media_names(joined) -> list[str]:
+    return [x.strip() for x in str(joined or "").split("|") if x.strip()]
+
+
+def _student_media_allowed(
+    student_id: int,
+    exam_id: int,
+    filename: str,
+    *,
+    shared: bool = False,
+    column: str = "sheet",
+) -> bool:
+    """确认文件名属于当前学生，或属于当前考试允许查看的共用试卷。"""
+    try:
+        name = cloud_store.safe_media_name(filename)
+    except ValueError:
+        return False
+    if not student_id or exam_id is None:
+        return False
+    if shared:
+        allowed = query(
+            """SELECT 1 FROM exams
+               WHERE id=?
+                 AND instr('|'||COALESCE(paper,'')||'|','|'||?||'|')>0
+               LIMIT 1""",
+            (int(exam_id), name),
+        )
+    else:
+        if column == "paper":
+            allowed = query(
+                """SELECT 1 FROM scores
+                   WHERE student_id=? AND exam_id=?
+                     AND instr('|'||COALESCE(paper,'')||'|','|'||?||'|')>0
+                   LIMIT 1""",
+                (int(student_id), int(exam_id), name),
+            )
+        else:
+            allowed = query(
+                """SELECT 1 FROM scores
+                   WHERE student_id=? AND exam_id=?
+                     AND instr('|'||COALESCE(sheet,'')||'|','|'||?||'|')>0
+                   LIMIT 1""",
+                (int(student_id), int(exam_id), name),
+            )
+    return not allowed.empty
+
+
+def _show_media(
+    joined,
+    caption: str = "",
+    *,
+    student_id: int | None = None,
+    exam_id: int | None = None,
+    shared: bool = False,
+    column: str = "sheet",
+) -> None:
     """显示试卷 / 答题卡：图片直接显示（自动适配手机宽度），PDF 给下载按钮。"""
-    names = [x for x in str(joined or "").split("|") if x.strip()]
+    names = _media_names(joined)
+    if not names:
+        return
+    if student_id is not None or exam_id is not None:
+        if student_id is None or exam_id is None:
+            st.warning(f"{caption}无权查看。")
+            return
+        for n in names:
+            if not _student_media_allowed(
+                int(student_id), int(exam_id), n, shared=shared, column=column
+            ):
+                st.warning(f"{caption}无权查看。")
+                return
     for n in names:
         try:
             path = cloud_store.ensure_local_photo(n, _photos_dir())
@@ -797,14 +864,8 @@ def page_student_courses() -> None:
             st.markdown(f"<div class='sdate'>{html.escape(str(last_day))}</div>", unsafe_allow_html=True)
         _render_student_course_card(row)
 
-def page_student_scores() -> None:
-    user = current_user()
-    if user is None or user["role"] != ROLE_STUDENT or not user.get("student_id"):
-        st.error("学生账号未正确绑定，请联系老师")
-        st.stop()
-    st.title("我的成绩")
-    sid = int(user["student_id"])
-    df = query(
+def _student_score_rows(student_id: int) -> pd.DataFrame:
+    return query(
         """SELECT e.id AS exam_id, e.name AS exam_name, e.exam_date, e.subject, e.full_score,
                   COALESCE(e.school,'') AS school, COALESCE(e.grade,'') AS grade,
                   sc.id AS score_id, sc.score, sc.wrong_qs, sc.knowledge, sc.note,
@@ -834,8 +895,18 @@ def page_student_scores() -> None:
                )
            )
            ORDER BY e.exam_date DESC, e.id DESC""",
-        (sid, sid),
+        (int(student_id), int(student_id)),
     )
+
+
+def page_student_scores() -> None:
+    user = current_user()
+    if user is None or user["role"] != ROLE_STUDENT or not user.get("student_id"):
+        st.error("学生账号未正确绑定，请联系老师")
+        st.stop()
+    st.title("我的成绩")
+    sid = int(user["student_id"])
+    df = _student_score_rows(sid)
     if df.empty:
         st.info("暂时没有可查看的考试记录。")
         return
@@ -884,7 +955,20 @@ def page_student_scores() -> None:
             paper = str(row.get("exam_paper") or "").strip() or str(row.get("paper") or "").strip()
             if paper:
                 st.markdown("**试卷**")
-                _show_media(paper, "试卷")
+                _show_media(
+                    paper,
+                    "试卷",
+                    student_id=sid,
+                    exam_id=int(row["exam_id"]),
+                    shared=bool(str(row.get("exam_paper") or "").strip()),
+                    column="paper",
+                )
             if str(row.get("sheet") or "").strip():
                 st.markdown("**我的答题卡**")
-                _show_media(row.get("sheet"), "答题卡")
+                _show_media(
+                    row.get("sheet"),
+                    "答题卡",
+                    student_id=sid,
+                    exam_id=int(row["exam_id"]),
+                    column="sheet",
+                )

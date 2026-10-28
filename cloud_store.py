@@ -83,6 +83,23 @@ def normalize_slug(slug: str | None) -> str:
     return text[:40]
 
 
+def safe_media_name(filename: str) -> str:
+    """只接受单个文件名，禁止目录穿越和附件列表分隔符。"""
+    name = str(filename or "").strip()
+    if (
+        not name
+        or name in (".", "..")
+        or "/" in name
+        or "\\" in name
+        or "|" in name
+        or "\x00" in name
+    ):
+        raise ValueError("媒体文件名不合法")
+    if Path(name).name != name:
+        raise ValueError("媒体文件名不合法")
+    return name
+
+
 def is_default_slug(slug: str | None) -> bool:
     """空值或 default 都指向原来那份库，保证老数据不用搬家。"""
     return normalize_slug(slug) in ("", DEFAULT_SLUG)
@@ -105,7 +122,7 @@ def backup_object_path(object_path: str, day: str) -> str:
 
 
 def photo_object_path(filename: str, slug: str | None = None) -> str:
-    name = str(filename).lstrip("/")
+    name = safe_media_name(filename)
     if is_default_slug(slug):
         return f"photos/{name}"
     return f"photos/{normalize_slug(slug)}/{name}"
@@ -135,6 +152,24 @@ def current_slug() -> str:
     except Exception:
         pass
     return _session_slug or DEFAULT_SLUG
+
+
+def session_db_path(default: str | Path) -> Path:
+    """按当前会话取数据库路径；模块级默认值只作为兜底。"""
+    try:
+        if st is not None:
+            value = st.session_state.get("db_path")
+            if value:
+                return Path(value)
+    except Exception:
+        pass
+    return Path(default)
+
+
+def session_photos_dir(default_db: str | Path) -> Path:
+    path = session_db_path(default_db).parent / "photos"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def get_data_dir(local_dir: str | Path, slug: str | None = None) -> Path:
@@ -311,11 +346,16 @@ def upload_photo(local_path: str | Path, filename: str, slug: str | None = None)
 
 
 def ensure_local_photo(filename: str, local_dir: str | Path, slug: str | None = None) -> Path:
-    target = Path(local_dir) / filename
+    name = safe_media_name(filename)
+    base = Path(local_dir).resolve()
+    base.mkdir(parents=True, exist_ok=True)
+    target = base / name
+    if target.resolve().parent != base:
+        raise ValueError("媒体文件路径不合法")
     if target.exists():
         return target
     if is_cloud():
-        download_file(photo_object_path(filename, current_slug() if slug is None else slug), target)
+        download_file(photo_object_path(name, current_slug() if slug is None else slug), target)
     return target
 
 
