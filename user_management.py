@@ -30,6 +30,41 @@ LOGIN_LOCK_SECONDS = 10 * 60
 LOGIN_MAX_FAILURES = 5
 PASSWORD_ITERATIONS = 310_000
 PASSWORD_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+NOTICE_VERSION = "v1"
+NOTICE_DATE = "2026-10-28"
+
+NOTICE_MARKDOWN = """
+### 教务工作台 体验版说明
+
+#### 1. 这是什么
+教务工作台是供校外教学机构和老师管理课程、学生、成绩和课时的在线工具。目前是体验版，功能还在完善，可能出现故障、短时间无法访问或功能调整。
+
+#### 2. 数据归谁
+您录入的学生、课程、成绩、试卷等数据归您（个人老师）或您所在的机构所有。平台方只是按您的使用需要替您存储和处理这些数据，不会把它们用于其他目的，也不会提供给第三方（法律法规要求或有权机关依法要求的除外）。
+
+#### 3. 平台方能看到什么
+- 日常只能看到运营数据：机构和账号数量、学生和课程的数量、最近登录时间、存储占用。看不到学生姓名、成绩、试卷。
+- 只有在排查问题且经您同意时，平台方才会临时只读查看您的数据。每次查看都会记录（谁、何时、为什么），您可以在“平台方访问记录”里看到。
+- 不会用您的真实数据做宣传或展示。
+
+#### 4. 关于学生个人信息
+学生信息，尤其是未满 14 周岁学生的信息，受法律特别保护。录入前，请确认您（或您的机构）已取得学生监护人的同意。请只录入教学必需的信息，不要录入身份证号、住址等与教学无关的内容。
+
+#### 5. 您的账号
+请妥善保管密码，不要与他人共用账号。发现异常登录，请立即联系我们。请确保您开展的教学活动符合当地有关规定。
+
+#### 6. 数据导出和删除
+您可以随时申请导出全部数据，也可以申请删除。删除后线上数据会清除，历史备份最长保留 30 天，到期自动清除。
+
+#### 7. 备份与风险
+系统每日自动备份，但体验版不保证数据永不丢失。请自行保留重要资料的原件。
+
+#### 8. 安全事件
+如发生可能影响您数据的安全事件，我们会及时通知您。
+
+#### 9. 联系我们
+[平台方名称] · [微信/电话]
+"""
 
 
 def configure(db_path: str | Path) -> None:
@@ -278,6 +313,15 @@ def init_user_db(
                 detail TEXT DEFAULT '',
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS consent_records(
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                version TEXT NOT NULL,
+                accepted_at TEXT NOT NULL,
+                UNIQUE(user_id, version)
+            );
+            CREATE INDEX IF NOT EXISTS idx_consent_user
+                ON consent_records(user_id, accepted_at);
             """
         )
 
@@ -570,6 +614,139 @@ def current_user():
         logout()
         return None
     return row.to_dict()
+
+
+def has_accepted_notice(
+    user_id: int,
+    *,
+    db_path: str | Path | None = None,
+    version: str = NOTICE_VERSION,
+) -> bool:
+    """检查账号是否同意过当前版本的说明；只读指定库，不跨会话猜路径。"""
+    target = Path(db_path) if db_path is not None else _auth_db_path()
+    conn = _connect(target)
+    try:
+        row = conn.execute(
+            """SELECT 1 FROM consent_records
+               WHERE user_id=? AND version=? LIMIT 1""",
+            (int(user_id), str(version)),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def notice_required(
+    user: dict | None = None,
+    *,
+    db_path: str | Path | None = None,
+) -> bool:
+    """老师与机构管理员需要同意；学生不需要，代入查看时也不写管理员自己的记录。"""
+    current = user or current_user()
+    if not current or current.get("role") != ROLE_TEACHER:
+        return False
+    if platform_store.is_impersonating():
+        return False
+    return not has_accepted_notice(
+        int(current["id"]),
+        db_path=db_path,
+    )
+
+
+def accept_notice(
+    user: dict,
+    *,
+    db_path: str | Path | None = None,
+    object_path: str | None = None,
+    version: str = NOTICE_VERSION,
+) -> tuple[bool, str]:
+    """记录同意版本和时间，并写平台审计。重复提交保持幂等。"""
+    if not user or user.get("role") != ROLE_TEACHER:
+        return False, "当前账号不需要确认这份说明"
+    if platform_store.is_impersonating():
+        return False, "代入查看期间不能修改任何数据"
+
+    target = Path(db_path) if db_path is not None else _auth_db_path()
+    accepted_at = _now()
+    conn = _connect(target)
+    inserted = False
+    try:
+        cur = conn.execute(
+            """INSERT OR IGNORE INTO consent_records(user_id, version, accepted_at)
+               VALUES(?,?,?)""",
+            (int(user["id"]), str(version), accepted_at),
+        )
+        inserted = int(cur.rowcount or 0) > 0
+        conn.commit()
+    finally:
+        conn.close()
+
+    if inserted:
+        if db_path is None:
+            cloud_store.save_database(target)
+        else:
+            cloud_store.save_database(target, object_path)
+        try:
+            actor_role = str(
+                st.session_state.get("auth_actor_role")
+                or ROLE_TEACHER
+            )
+            org_id = user.get("org_id")
+            if pd.isna(org_id):
+                org_id = None
+            platform_store.record_audit(
+                "consent_accepted",
+                actor_user_id=int(user["id"]),
+                actor_role=actor_role,
+                org_id=int(org_id) if org_id is not None else None,
+                target_type="account",
+                target_id=int(user["id"]),
+                detail=f"version={str(version)}",
+            )
+        except Exception as exc:
+            print(f"[user_management] 写同意审计失败：{exc}", file=sys.stderr)
+    return True, ""
+
+
+def page_notice(require_acceptance: bool = False) -> None:
+    """体验版说明页；首次登录时作为必须通过的页面使用。"""
+    user = current_user()
+    if user is None:
+        st.stop()
+    if user.get("role") != ROLE_TEACHER:
+        st.error("学生账号不需要确认这份说明")
+        st.stop()
+
+    st.title("体验版说明")
+    st.markdown(NOTICE_MARKDOWN)
+    st.caption(f"版本 {NOTICE_VERSION} · {NOTICE_DATE}")
+
+    accepted = has_accepted_notice(int(user["id"]))
+    if accepted and not require_acceptance:
+        st.success("当前账号已同意这一版说明。版本更新后会再次提示。")
+
+    if platform_store.is_impersonating():
+        st.info("代入查看期间只能阅读说明，不能修改同意记录。")
+        return
+
+    with st.form(f"notice_accept_{NOTICE_VERSION}"):
+        confirmed = st.checkbox("我已阅读并同意以上说明")
+        submitted = st.form_submit_button(
+            "同意并继续" if require_acceptance else "保存同意",
+            type="primary",
+            use_container_width=True,
+        )
+    if submitted:
+        if not confirmed:
+            st.error("请先勾选“我已阅读并同意以上说明”。")
+            return
+        ok, error = accept_notice(user)
+        if not ok:
+            st.error(error)
+            return
+        st.success("已记录同意。")
+        if require_acceptance:
+            st.rerun()
 
 
 def logout() -> None:
