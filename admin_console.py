@@ -19,6 +19,7 @@ import streamlit as st
 
 import cloud_store
 import course_management as cm
+import platform_store
 import teacher_registry
 import user_management as um
 
@@ -90,7 +91,13 @@ def _ago(value: str) -> str:
 
 # ==================== 开通 / 管理老师 ====================
 def create_teacher(
-    display_name: str, username: str, password: str, note: str = ""
+    display_name: str,
+    username: str,
+    password: str,
+    note: str = "",
+    *,
+    org_id: int | None = None,
+    org_role: str = "teacher",
 ) -> tuple[bool, str]:
     """开通一位新老师：建一份空库 + 建账号 + 登记名册。"""
     name = str(username or "").strip()
@@ -103,6 +110,13 @@ def create_teacher(
     pwd = str(password or "").strip()
     if len(pwd) < 6:
         return False, "初始密码至少 6 位"
+    if org_role not in (platform_store.ROLE_TEACHER, platform_store.ROLE_ORG_ADMIN):
+        return False, "机构权限不合法"
+    target_org_id = int(org_id) if org_id is not None else platform_store.default_org_id()
+    if target_org_id is None:
+        return False, "找不到可用的机构"
+    if platform_store.get_organization(target_org_id) is None:
+        return False, "机构不存在"
 
     slug = teacher_registry.unique_slug(name)
     object_path = cloud_store.db_object_path(slug)
@@ -113,13 +127,20 @@ def create_teacher(
     try:
         _init_schema(db, object_path)
         cm.init_course_db(db, object_path=object_path)
-        um.init_user_db(db, default_teacher_password=pwd, object_path=object_path)
+        um.init_user_db(
+            db,
+            default_teacher_password=pwd,
+            object_path=object_path,
+            org_id=target_org_id,
+        )
         conn = sqlite3.connect(db)
         try:
             # 把自动创建的 teacher 账号改成他真正的登录名，并要求首次登录改密
             conn.execute(
-                "UPDATE users SET username=?, must_change_password=1, note=? WHERE role='teacher'",
-                (name, str(note or "由总后台开通")),
+                """UPDATE users
+                   SET username=?, must_change_password=1, note=?, org_id=?
+                   WHERE role='teacher'""",
+                (name, str(note or "由总后台开通"), target_org_id),
             )
             conn.commit()
         finally:
@@ -130,6 +151,11 @@ def create_teacher(
     ok, err = teacher_registry.add_teacher(name, display_name, slug)
     if not ok:
         return False, err
+    member_ok, member_err = platform_store.add_org_user(
+        target_org_id, slug, org_role
+    )
+    if not member_ok:
+        return False, member_err
     cloud_store.save_database(db, object_path)
     teacher_registry.note_usernames(slug, db)
     return True, ""
@@ -250,6 +276,244 @@ def set_teacher_active(slug: str, active: bool) -> tuple[bool, str]:
     return True, ""
 
 
+def create_organization_with_admin(
+    org_name: str,
+    kind: str,
+    admin_username: str,
+    admin_display_name: str,
+    password: str,
+    *,
+    note: str = "",
+    public_name_ok: bool = False,
+    status: str = "体验",
+) -> tuple[bool, str, int | None]:
+    """新建机构，并在同一份新库里创建第一位机构管理员。"""
+    name = str(admin_username or "").strip()
+    if not name:
+        return False, "请填写机构管理员登录账号", None
+    if not name.isascii() or any(ch.isspace() for ch in name):
+        return False, "登录账号请用英文字母或数字，不要有空格", None
+    if teacher_registry.username_owner(name) is not None:
+        return False, f"账号「{name}」已经被占用了，换一个", None
+    org_id, err = platform_store.create_organization(
+        org_name,
+        kind=kind,
+        status=status,
+        note=note,
+        public_name_ok=public_name_ok,
+    )
+    if org_id is None:
+        return False, err, None
+    ok, err = create_teacher(
+        admin_display_name,
+        name,
+        password,
+        note=note or "机构管理员",
+        org_id=org_id,
+        org_role=platform_store.ROLE_ORG_ADMIN,
+    )
+    if not ok:
+        return False, err, org_id
+    return True, "", org_id
+
+
+def _org_member(
+    org_id: int,
+    slug: str,
+) -> tuple[dict | None, str]:
+    member = platform_store.org_user_for_slug(slug)
+    if not member or int(member["org_id"]) != int(org_id):
+        return None, "这位老师不属于当前机构"
+    entry = teacher_registry.teacher_entry(slug)
+    if entry is None:
+        return None, "找不到这位老师"
+    return entry, ""
+
+
+def org_set_teacher_active(
+    org_id: int,
+    actor_slug: str,
+    target_slug: str,
+    active: bool,
+) -> tuple[bool, str]:
+    """机构管理员停用/启用本机构老师，禁止跨机构和停用机构管理员。"""
+    entry, err = _org_member(org_id, target_slug)
+    if entry is None:
+        return False, err
+    member = platform_store.org_user_for_slug(target_slug) or {}
+    if not active and member.get("role") == platform_store.ROLE_ORG_ADMIN:
+        return False, "机构管理员账号不能在这里停用"
+    if target_slug == actor_slug and not active:
+        return False, "不能停用自己的账号"
+    teacher_registry.update_teacher(target_slug, active=bool(active))
+    return True, ""
+
+
+def org_reset_teacher_password(
+    org_id: int,
+    target_slug: str,
+    password: str,
+) -> tuple[bool, str]:
+    entry, err = _org_member(org_id, target_slug)
+    if entry is None:
+        return False, err
+    return reset_teacher_password(target_slug, password)
+
+
+def org_teacher_rows(org_id: int) -> list[dict]:
+    rows = []
+    for member in platform_store.list_org_users(org_id):
+        entry = teacher_registry.teacher_entry(member.get("slug"))
+        if entry is None:
+            continue
+        rows.append(
+            {
+                "slug": member["slug"],
+                "role": member["role"],
+                "username": str(entry.get("username") or ""),
+                "display_name": str(entry.get("display_name") or ""),
+                "active": bool(entry.get("active", True)),
+            }
+        )
+    return rows
+
+
+def _require_org_admin() -> tuple[str, int]:
+    user = um.current_user()
+    if user is None or user.get("role") != um.ROLE_TEACHER:
+        st.error("没有权限访问机构管理")
+        st.stop()
+    slug = cloud_store.current_slug()
+    member = platform_store.org_user_for_slug(slug)
+    if not member or member.get("role") != platform_store.ROLE_ORG_ADMIN:
+        st.error("没有权限访问机构管理")
+        st.stop()
+    org_id = int(member["org_id"])
+    org = platform_store.get_organization(org_id)
+    if org is None:
+        st.error("找不到所属机构")
+        st.stop()
+    if org.get("kind") == "个人":
+        st.error("个人机构不需要机构管理页面")
+        st.stop()
+    return slug, org_id
+
+
+def page_org_admin() -> None:
+    """机构管理员页面：只管理本机构老师账号。"""
+    my_slug, org_id = _require_org_admin()
+    org = platform_store.get_organization(org_id) or {}
+    st.title("机构管理")
+    st.caption(
+        f"{org.get('name') or '未命名机构'} · {org.get('kind') or '机构'} · "
+        f"{org.get('status') or '体验'}"
+    )
+    st.caption("这里只能管理本机构的老师账号，看不到其他机构，也看不到学生成绩。")
+
+    created = st.session_state.pop("org_teacher_created", None)
+    reset = st.session_state.pop("org_teacher_reset", None)
+    if created:
+        st.success(f"老师账号已创建：{created['username']}")
+        st.code(
+            f"登录账号：{created['username']}\n初始密码：{created['password']}",
+            language=None,
+        )
+        st.caption("首次登录会要求修改密码。")
+    if reset:
+        st.success(f"账号 {reset['username']} 的密码已重置")
+        st.code(
+            f"登录账号：{reset['username']}\n新密码：{reset['password']}",
+            language=None,
+        )
+
+    with st.expander("＋ 开通本机构老师", expanded=False):
+        with st.form("org_new_teacher"):
+            f1, f2, f3 = st.columns(3)
+            display_name = f1.text_input(
+                "老师称呼", placeholder="例如：李老师", key="org_new_display"
+            )
+            username = f2.text_input(
+                "登录账号", placeholder="英文字母或数字", key="org_new_username"
+            )
+            password = f3.text_input(
+                "初始密码", placeholder="留空自动生成", key="org_new_password"
+            )
+            submitted = st.form_submit_button("开通", type="primary")
+        if submitted:
+            pwd = str(password or "").strip() or um.generate_password()
+            ok, err = create_teacher(
+                display_name,
+                username,
+                pwd,
+                note="由机构管理员开通",
+                org_id=org_id,
+                org_role=platform_store.ROLE_TEACHER,
+            )
+            if ok:
+                st.session_state["org_teacher_created"] = {
+                    "username": str(username).strip(),
+                    "password": pwd,
+                }
+                st.rerun()
+            else:
+                st.error(err)
+
+    rows = org_teacher_rows(org_id)
+    st.subheader("本机构老师")
+    if not rows:
+        st.info("还没有老师账号。")
+        return
+    for item in rows:
+        label = item["display_name"] or item["username"]
+        state = "启用" if item["active"] else "已停用"
+        role = platform_store.ROLE_LABELS.get(item["role"], item["role"])
+        marks = [role]
+        if item["slug"] == my_slug:
+            marks.append("我")
+        with st.expander(f"{label}（{item['username']}）· {state} · {'、'.join(marks)}"):
+            st.caption("这里只管理老师登录账号，不会查看他的学生和成绩。")
+            if item["role"] == platform_store.ROLE_ORG_ADMIN:
+                st.info("机构管理员账号不能在这里停用。")
+            elif item["slug"] == my_slug:
+                st.info("请到「账号」页面修改自己的密码。")
+            else:
+                with st.form(f"org_reset_{item['slug']}"):
+                    newpwd = st.text_input(
+                        "重置登录密码",
+                        placeholder="留空自动生成",
+                        key=f"org_reset_pwd_{item['slug']}",
+                    )
+                    reset_submitted = st.form_submit_button("重置密码")
+                if reset_submitted:
+                    pwd = str(newpwd or "").strip() or um.generate_password()
+                    ok, err = org_reset_teacher_password(
+                        org_id, item["slug"], pwd
+                    )
+                    if ok:
+                        st.session_state["org_teacher_reset"] = {
+                            "username": item["username"],
+                            "password": pwd,
+                        }
+                        st.rerun()
+                    else:
+                        st.error(err)
+
+                target_active = not item["active"]
+                button_text = "启用账号" if target_active else "停用账号"
+                if st.button(
+                    button_text,
+                    key=f"org_toggle_{item['slug']}",
+                    use_container_width=True,
+                ):
+                    ok, err = org_set_teacher_active(
+                        org_id, my_slug, item["slug"], target_active
+                    )
+                    if ok:
+                        st.rerun()
+                    else:
+                        st.error(err)
+
+
 def teacher_students(slug: str) -> pd.DataFrame:
     db = _teacher_db(slug)
     return _read(
@@ -277,6 +541,7 @@ def create_student_account(
     ok, err = um.create_account_in(
         db, name, str(password or "").strip(), um.ROLE_STUDENT,
         student_id=int(student_id), must_change_password=True, note="由总后台开通",
+        org_id=platform_store.org_id_for_slug(slug),
     )
     if not ok:
         return False, err
@@ -290,6 +555,83 @@ def page_admin() -> None:
     my_slug = _require_admin()
     st.title("总后台")
     st.caption("只有创始者能看到这一页；其他老师登录后看不到。")
+
+    # ---------- 机构 ----------
+    st.subheader("机构")
+    organizations = platform_store.list_organizations()
+    if organizations:
+        for org in organizations:
+            members = platform_store.list_org_users(int(org["id"]))
+            admin_count = sum(
+                1 for member in members
+                if member.get("role") == platform_store.ROLE_ORG_ADMIN
+            )
+            st.markdown(
+                f"**{org['name']}**　"
+                f"{org.get('kind') or '机构'} · {org.get('status') or '体验'} · "
+                f"{len(members)} 位老师"
+                + (f" · {admin_count} 位机构管理员" if admin_count else "")
+            )
+    else:
+        st.info("还没有机构记录。")
+
+    with st.expander("＋ 新建机构并开通机构管理员", expanded=False):
+        st.caption(
+            "新机构只能由平台创建；机构管理员登录后可以自己开通本机构老师账号。"
+        )
+        with st.form("admin_new_org"):
+            o1, o2, o3 = st.columns(3)
+            org_name = o1.text_input("机构名称", placeholder="例如：XX教育")
+            org_kind = o2.selectbox("机构类型", list(platform_store.ORG_KINDS))
+            org_status = o3.selectbox(
+                "初始状态", ["体验", "正式"], index=0
+            )
+            admin_display = st.text_input(
+                "机构管理员称呼", placeholder="例如：王老师"
+            )
+            admin_username = st.text_input(
+                "机构管理员登录账号", placeholder="英文字母或数字"
+            )
+            admin_password = st.text_input(
+                "初始密码", placeholder="留空自动生成"
+            )
+            public_name_ok = st.checkbox("允许以后公开展示机构名称")
+            org_note = st.text_area("备注", placeholder="可留空")
+            submitted = st.form_submit_button("创建机构", type="primary")
+        if submitted:
+            pwd = str(admin_password or "").strip() or um.generate_password()
+            ok, err, org_id = create_organization_with_admin(
+                org_name,
+                org_kind,
+                admin_username,
+                admin_display,
+                pwd,
+                note=org_note,
+                public_name_ok=public_name_ok,
+                status=org_status,
+            )
+            if ok:
+                st.session_state["admin_new_org_done"] = {
+                    "org_name": str(org_name).strip(),
+                    "username": str(admin_username).strip(),
+                    "password": pwd,
+                }
+                st.rerun()
+            else:
+                st.error(err)
+        org_done = st.session_state.pop("admin_new_org_done", None)
+        if org_done:
+            st.success(
+                f"机构「{org_done['org_name']}」和机构管理员账号已创建，"
+                "请把下面这组信息发给机构管理员。"
+            )
+            st.code(
+                f"登录账号：{org_done['username']}\n初始密码：{org_done['password']}",
+                language=None,
+            )
+            st.caption("机构管理员首次登录会被要求修改密码。")
+
+    st.divider()
 
     entries = teacher_registry.list_teachers()
     total_students = sum(int((e.get("stats") or {}).get("students") or 0) for e in entries)

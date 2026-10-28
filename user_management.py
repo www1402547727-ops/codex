@@ -222,6 +222,7 @@ def init_user_db(
     db_path: str | Path | None = None,
     default_teacher_password: str | None = None,
     object_path: str | None = None,
+    org_id: int | None = None,
 ) -> None:
     """建账号相关表并（首次）创建老师账号。
 
@@ -238,6 +239,7 @@ def init_user_db(
                 username TEXT NOT NULL COLLATE NOCASE UNIQUE,
                 password_hash TEXT NOT NULL,
                 role TEXT NOT NULL CHECK(role IN ('teacher','student')),
+                org_id INTEGER,
                 student_id INTEGER,
                 active INTEGER NOT NULL DEFAULT 1,
                 must_change_password INTEGER NOT NULL DEFAULT 0,
@@ -264,6 +266,13 @@ def init_user_db(
                 created_at TEXT NOT NULL
             );
             """
+        )
+
+        user_columns = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
+        if "org_id" not in user_columns:
+            conn.execute("ALTER TABLE users ADD COLUMN org_id INTEGER")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_users_org ON users(org_id, role)"
         )
 
         columns = {row[1] for row in conn.execute("PRAGMA table_info(one_to_one_students)")}
@@ -305,17 +314,23 @@ def init_user_db(
                 raise RuntimeError("首次初始化老师账号时必须设置 SCORE_TRACKER_PASSWORD")
             conn.execute(
                 """INSERT INTO users
-                   (username, password_hash, role, active, must_change_password, created_at, note)
-                   VALUES(?,?,?,?,?,?,?)""",
+                   (username, password_hash, role, org_id, active, must_change_password, created_at, note)
+                   VALUES(?,?,?,?,?,?,?,?)""",
                 (
                     "teacher",
                     hash_password(initial_password),
                     ROLE_TEACHER,
+                    int(org_id) if org_id is not None else None,
                     1,
                     0,
                     _now(),
                     "首次启动自动创建",
                 ),
+            )
+        elif org_id is not None:
+            conn.execute(
+                "UPDATE users SET org_id=? WHERE org_id IS NULL",
+                (int(org_id),),
             )
         conn.commit()
         cloud_store.save_database(target, object_path)
@@ -331,6 +346,7 @@ def create_account_in(
     student_id: int | None = None,
     must_change_password: bool = True,
     note: str = "",
+    org_id: int | None = None,
 ) -> tuple[bool, str]:
     """在**指定**数据库里创建账号（总后台替某位老师开账号时用）。
 
@@ -355,13 +371,14 @@ def create_account_in(
             if bound:
                 return False, f"这位学生已经有账号了（{bound['username']}）"
         conn.execute(
-            """INSERT INTO users(username, password_hash, role, student_id, active,
+            """INSERT INTO users(username, password_hash, role, org_id, student_id, active,
                                  must_change_password, created_at, note)
-               VALUES(?,?,?,?,1,?,?,?)""",
+               VALUES(?,?,?,?,?,1,?,?,?)""",
             (
                 name,
                 hash_password(str(password)),
                 role,
+                int(org_id) if org_id is not None else None,
                 int(student_id) if student_id is not None else None,
                 1 if must_change_password else 0,
                 _now(),
@@ -605,7 +622,12 @@ def page_account(force_change: bool = False) -> None:
         st.write("学生账号只能查看自己的课程与成绩，不能查看其他学生资料。")
 
 
-def _create_student_account(student_id: int, username: str, password: str) -> tuple[bool, str]:
+def _create_student_account(
+    student_id: int,
+    username: str,
+    password: str,
+    org_id: int | None = None,
+) -> tuple[bool, str]:
     username = username.strip()
     if not username:
         return False, "请填写账号"
@@ -621,9 +643,19 @@ def _create_student_account(student_id: int, username: str, password: str) -> tu
         return False, "这个账号名已经存在"
     run(
         """INSERT INTO users
-           (username, password_hash, role, student_id, active, must_change_password, created_at)
-           VALUES(?,?,?,?,?,?,?)""",
-        (username, hash_password(password), ROLE_STUDENT, int(student_id), 1, 1, _now()),
+           (username, password_hash, role, org_id, student_id, active,
+            must_change_password, created_at)
+           VALUES(?,?,?,?,?,?,?,?)""",
+        (
+            username,
+            hash_password(password),
+            ROLE_STUDENT,
+            int(org_id) if org_id is not None else None,
+            int(student_id),
+            1,
+            1,
+            _now(),
+        ),
     )
     _audit(username, "student_account_created", f"student_id={int(student_id)}")
     return True, ""
@@ -688,7 +720,12 @@ def page_user_admin(allow_delete: bool = True) -> None:
                 submitted = st.form_submit_button("创建账号", type="primary")
             if submitted:
                 initial = password.strip() or generate_password()
-                ok, error = _create_student_account(int(student_id), username, initial)
+                org_id = user.get("org_id")
+                if pd.isna(org_id):
+                    org_id = None
+                ok, error = _create_student_account(
+                    int(student_id), username, initial, int(org_id) if org_id is not None else None
+                )
                 if ok:
                     st.session_state["account_created"] = {
                         "username": username.strip(),

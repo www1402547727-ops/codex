@@ -41,12 +41,14 @@ if _MISSING_API:
 
 import admin_console
 import course_management as cm
+import platform_store
 import teacher_registry
 import ui_theme
 import user_management as um
 
 cloud_store.configure_from_streamlit()
 teacher_registry.configure(BASE / "data")
+platform_store.configure(BASE / "data")
 
 # ==================== 定位当前会话用哪一份数据库 ====================
 # 每位老师一份独立数据库：已登录时按登录名定位到他那一份；
@@ -74,6 +76,12 @@ if SESSION_SLUG is None:
         # 安全阀：读不到现有账号时宁可报错重试，也绝不写一份空名册把所有人锁在门外
         st.error(str(exc))
         st.stop()
+
+try:
+    platform_store.ensure_ready(teacher_registry.list_teachers())
+except Exception as exc:
+    # 平台库异常不应让原有老师和学生无法登录；机构功能会在管理员页面显示错误。
+    print(f"[app] 平台机构库初始化失败：{exc}", file=sys.stderr)
 
 
 # 把「添加到主屏幕」需要的 meta / manifest 注入到页面 <head>（iPhone、安卓通用）
@@ -1757,10 +1765,12 @@ def activate_database(slug: str) -> tuple[bool, str]:
     cm.configure(DB)
     cm.init_course_db(DB)
     um.configure(DB)
+    org_id = platform_store.org_id_for_slug(slug)
     try:
         um.init_user_db(
             DB,
             default_teacher_password=PASSWORD if cloud_store.is_default_slug(slug) else None,
+            org_id=org_id,
         )
     except RuntimeError as exc:
         return False, str(exc)
@@ -1822,6 +1832,16 @@ if user["role"] == um.ROLE_TEACHER:
     }
     # 只有创始者能开账号（老师账号和学生账号都是）；其他老师看不到「账号管理」
     IS_ADMIN = bool((teacher_registry.teacher_entry(SESSION_SLUG) or {}).get("is_admin"))
+    org_member = platform_store.org_user_for_slug(SESSION_SLUG)
+    org = platform_store.get_organization(
+        int(org_member["org_id"]) if org_member else None
+    )
+    IS_ORG_ADMIN = bool(
+        org_member
+        and org_member.get("role") == platform_store.ROLE_ORG_ADMIN
+        and org
+        and org.get("kind") != "个人"
+    )
     if IS_ADMIN:
         PAGES["账号管理"] = um.page_user_admin
         PAGES["总后台"] = admin_console.page_admin
@@ -1831,6 +1851,8 @@ if user["role"] == um.ROLE_TEACHER:
         # 总后台把开关打开了：老师可以给自己的学生开账号、重置密码，
         # 但没有删除入口（删除不可逆，留给总管理员）
         PAGES["账号管理"] = lambda: um.page_user_admin(allow_delete=False)
+    if IS_ORG_ADMIN:
+        PAGES["机构管理"] = admin_console.page_org_admin
     PAGES["账号"] = um.page_account
 else:
     PAGES = {

@@ -111,10 +111,17 @@ def db_object_path(slug: str | None = None) -> str:
     return f"database/{normalize_slug(slug)}/scores.db"
 
 
+def platform_object_path() -> str:
+    """平台级数据库的对象路径；和老师业务库分开。"""
+    return "database/platform.db"
+
+
 def backup_object_path(object_path: str, day: str) -> str:
     """把 database/<标识>/scores.db 映射成 backups/<日期>/<标识>/scores.db。"""
     if object_path == "database/scores.db":
         return f"backups/{day}/scores.db"
+    if object_path == platform_object_path():
+        return f"backups/{day}/platform.db"
     parts = str(object_path).split("/")
     if len(parts) == 3 and parts[0] == "database":
         return f"backups/{day}/{parts[1]}/scores.db"
