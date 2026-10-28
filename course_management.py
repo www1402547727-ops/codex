@@ -12,6 +12,7 @@ import pandas as pd
 import streamlit as st
 
 import cloud_store
+import platform_store
 
 
 DB_PATH = Path(__file__).parent / "data" / "scores.db"
@@ -82,7 +83,7 @@ def _connect(db_path: str | Path | None = None) -> sqlite3.Connection:
     target = Path(db_path) if db_path is not None else _db_path()
     conn = sqlite3.connect(target, timeout=15)
     conn.row_factory = sqlite3.Row
-    return conn
+    return platform_store.guard_connection(conn, content_scope=True)
 
 
 def _clean(params):
@@ -90,6 +91,7 @@ def _clean(params):
 
 
 def run(sql: str, params=()) -> int:
+    platform_store.assert_content_write_allowed()
     conn = _connect()
     try:
         cur = conn.execute(sql, _clean(params))
@@ -101,6 +103,7 @@ def run(sql: str, params=()) -> int:
 
 
 def query(sql: str, params=()) -> pd.DataFrame:
+    platform_store.assert_content_read_allowed()
     conn = _connect()
     try:
         return pd.read_sql_query(sql, conn, params=_clean(params))

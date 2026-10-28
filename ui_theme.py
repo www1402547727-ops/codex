@@ -75,6 +75,14 @@ div[data-testid="stVerticalBlockBorderWrapper"] { border-radius: var(--radius) !
 [data-testid="stMetricLabel"] { color: var(--muted); }
 [data-testid="stMetricValue"] { font-weight: 700; }
 [data-testid="stAlert"] { border-radius: 10px; }
+.impersonation-banner {
+  position: sticky; top: .35rem; z-index: 99999;
+  margin: 0 0 .9rem; padding: .78rem 1rem;
+  border: 1px solid #B42318; border-radius: 10px;
+  background: #B42318; color: #fff;
+  font-weight: 700; text-align: center; letter-spacing: .01em;
+  box-shadow: 0 8px 24px rgba(180,35,24,.22);
+}
 [data-testid="stImage"] img { border-radius: 10px; border: 1px solid var(--line); }
 [data-baseweb="input"], [data-baseweb="textarea"], [data-baseweb="select"] > div { border-radius: 10px !important; }
 button[role="tab"] { font-weight: 600; }

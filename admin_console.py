@@ -1,4 +1,4 @@
-"""总后台：创始者专用。开通老师、管理老师、查看所有老师的数据。
+"""平台管理：创始者专用。运营概览、机构/老师账号管理、临时只读代入。
 
 设计前提（改动前务必先读 AGENTS.md 的「多老师结构」）：
 - 每位老师一份独立数据库，云端路径 database/<标识>/scores.db；
@@ -20,6 +20,7 @@ import streamlit as st
 
 import cloud_store
 import course_management as cm
+import impersonation
 import platform_store
 import teacher_registry
 import user_management as um
@@ -33,7 +34,7 @@ def configure(init_schema) -> None:
     _init_schema = init_schema
 
 
-def _require_admin(page_label: str = "总后台") -> str:
+def _require_admin(page_label: str = "平台管理") -> str:
     user = um.current_user()
     if user is None or user.get("role") != um.ROLE_TEACHER:
         st.error(f"没有权限访问{page_label}")
@@ -1000,6 +1001,97 @@ def page_platform_overview() -> None:
     st.dataframe(table, hide_index=True, use_container_width=True)
 
     st.divider()
+    st.subheader("临时只读查看老师数据")
+    st.caption(
+        "必须填写理由、机构同意方式和日期，并勾选已获同意。进入后 30 分钟自动退出，"
+        "期间不能修改课程、学生、成绩或账号。"
+    )
+    organizations = platform_store.list_organizations()
+    org_options = {
+        int(org["id"]): f"{org.get('name') or '未命名机构'}"
+        + (f"（{org.get('kind') or '机构'}）" if org.get("kind") else "")
+        for org in organizations
+        if org.get("status") != "停用"
+    }
+    if not org_options:
+        st.info("暂无可用机构。")
+    else:
+        selected_org = st.selectbox(
+            "选择机构",
+            list(org_options),
+            format_func=org_options.get,
+            key="impersonation_org",
+        )
+        members = platform_store.list_org_users(int(selected_org))
+        member_options = {}
+        for member in members:
+            slug = cloud_store.normalize_slug(member.get("slug")) or cloud_store.DEFAULT_SLUG
+            entry = teacher_registry.teacher_entry(slug) or {}
+            if not bool(entry.get("active", True)):
+                continue
+            label = str(entry.get("display_name") or "").strip() or str(
+                entry.get("username") or slug
+            )
+            member_options[slug] = label
+        if not member_options:
+            st.info("这个机构暂时没有可查看的老师。")
+        else:
+            with st.form("platform_impersonation_form"):
+                selected_teacher = st.selectbox(
+                    "选择老师",
+                    list(member_options),
+                    format_func=member_options.get,
+                    key="impersonation_teacher",
+                )
+                reason = st.selectbox(
+                    "查看理由",
+                    list(impersonation.REASONS),
+                    key="impersonation_reason",
+                )
+                note = st.text_input(
+                    "补充说明",
+                    placeholder="必填，例如：老师反馈课程时间显示异常，需要核对",
+                    key="impersonation_note",
+                )
+                consent_method = st.selectbox(
+                    "机构同意方式",
+                    list(impersonation.CONSENT_METHODS),
+                    key="impersonation_consent_method",
+                )
+                consent_date = st.date_input(
+                    "机构同意日期",
+                    value=date.today(),
+                    key="impersonation_consent_date",
+                )
+                consent = st.checkbox(
+                    "已获得机构同意",
+                    key="impersonation_consent",
+                )
+                submitted = st.form_submit_button(
+                    "开始只读查看",
+                    type="primary",
+                    use_container_width=True,
+                )
+            if submitted:
+                if not consent:
+                    st.error("请先确认已获得机构同意。")
+                else:
+                    ok, err = impersonation.start(
+                        org_id=int(selected_org),
+                        teacher_slug=selected_teacher,
+                        reason=reason,
+                        note=note,
+                        consent_method=consent_method,
+                        consent_date=consent_date,
+                        consent_confirmed=consent,
+                        actor_user=um.current_user() or {},
+                    )
+                    if ok:
+                        st.rerun()
+                    else:
+                        st.error(err)
+
+    st.divider()
     st.subheader("存储与运行")
     s1, s2 = st.columns(2)
     s1.metric("数据库大小", _format_bytes(_database_size_bytes(rows)))
@@ -1030,8 +1122,8 @@ def page_platform_overview() -> None:
 
 def page_admin() -> None:
     my_slug = _require_admin()
-    st.title("总后台")
-    st.caption("只有创始者能看到这一页；其他老师登录后看不到。")
+    st.title("账号管理")
+    st.caption("只有平台管理员能看到这一页；这里只管理机构和老师账号，不查看学生内容。")
 
     # ---------- 机构 ----------
     st.subheader("机构")
@@ -1209,155 +1301,73 @@ def page_admin() -> None:
             m4.metric("最近使用", _ago(entry.get("last_active")))
             st.caption(f"数据位置：{cloud_store.db_object_path(slug)}")
 
-            tabs = st.tabs(["查看数据", "开学生账号", "管理"])
-
-            with tabs[0]:
-                db = _teacher_db(slug)
-                if not db.is_file():
-                    st.info("还没有数据（这位老师还没开始用，或者云端还没初始化）。")
-                else:
-                    students = _read(
-                        db,
-                        """SELECT s.name AS 学生, s.grade AS 年级, s.school AS 学校,
-                                  s.status AS 状态,
-                                  (SELECT u.username FROM users u WHERE u.student_id=s.id) AS 账号
-                           FROM students s ORDER BY s.id""",
-                    )
-                    st.markdown(f"**学生名单（{len(students)} 人）**")
-                    if students.empty:
-                        st.caption("暂无学生")
-                    else:
-                        st.dataframe(students, use_container_width=True, hide_index=True)
-
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        classes = _read(
-                            db,
-                            """SELECT c.name AS 班级, c.grade AS 年级,
-                                      CASE WHEN c.kind='一对一' THEN '一对一' ELSE '班课' END AS 类型
-                               FROM classes c ORDER BY c.id""",
-                        )
-                        st.markdown(f"**班级（{len(classes)} 个）**")
-                        st.dataframe(classes, use_container_width=True, hide_index=True)
-                    with c2:
-                        exams = _read(
-                            db,
-                            """SELECT e.name AS 考试, e.exam_date AS 日期,
-                                      COUNT(s.id) AS 成绩条数
-                               FROM exams e LEFT JOIN scores s ON s.exam_id=e.id
-                               GROUP BY e.id ORDER BY e.exam_date DESC LIMIT 20""",
-                        )
-                        st.markdown(f"**考试（{len(exams)} 场）**")
-                        st.dataframe(exams, use_container_width=True, hide_index=True)
-                    st.caption("这里只能看，不能改。要改某位老师的数据，请用他自己的账号登录。")
-
-            with tabs[1]:
-                st.caption("老师自己不能开账号，所以学生的账号由你在这里开。")
-                students = teacher_students(slug)
-                if students.empty:
-                    st.info("这位老师还没有学生。让他在自己的「学生」页添加学生后，你再来开账号。")
-                else:
-                    options = {
-                        int(row["id"]): f"{row['name']}"
-                        + (f"（{row['grade']}）" if str(row["grade"] or "").strip() else "")
-                        + ("· 已有账号 " + str(row["账号"]) if str(row["账号"] or "").strip() else "")
-                        for _, row in students.iterrows()
-                    }
-                    with st.form(f"admin_new_student_{slug}"):
-                        sid = st.selectbox(
-                            "选择学生", list(options), format_func=options.get,
-                            key=f"pick_{slug}",
-                        )
-                        s1, s2 = st.columns(2)
-                        uname = s1.text_input("账号", placeholder="例如 wx01 或学号", key=f"stu_uname_{slug}")
-                        upwd = s2.text_input("初始密码", placeholder="留空自动生成", key=f"stu_pwd_{slug}")
-                        sub = st.form_submit_button("给他开账号", type="primary")
-                    if sub:
-                        pwd = str(upwd or "").strip() or um.generate_password()
-                        ok, err = create_student_account(slug, int(sid), uname, pwd)
+            if entry.get("is_admin"):
+                st.caption("管理员账号不能停用——停用后平台就进不去了。")
+            else:
+                is_active = bool(entry.get("active", True))
+                if is_active:
+                    if st.button("停用这位老师", key=f"off_{slug}"):
+                        ok, err = set_teacher_active(slug, False)
                         if ok:
-                            st.session_state[f"admin_new_student_done_{slug}"] = {
-                                "username": str(uname).strip(), "password": pwd,
-                            }
+                            st.success("已停用。他和他的学生都登不进来了，数据都还在。")
                             st.rerun()
                         else:
                             st.error(err)
-                    made = st.session_state.pop(f"admin_new_student_done_{slug}", None)
-                    if made:
-                        st.success("开好了，把下面这组发给他（关掉就看不到了）")
-                        st.code(
-                            f"登录账号：{made['username']}\n初始密码：{made['password']}",
-                            language=None,
-                        )
-
-            with tabs[2]:
-                if entry.get("is_admin"):
-                    st.caption("管理员账号不能停用——停用后总后台就进不去了。")
                 else:
-                    is_active = bool(entry.get("active", True))
-                    if is_active:
-                        if st.button("停用这位老师", key=f"off_{slug}"):
-                            ok, err = set_teacher_active(slug, False)
-                            if ok:
-                                st.success("已停用。他和他的学生都登不进来了，数据都还在。")
-                                st.rerun()
-                            else:
-                                st.error(err)
-                    else:
-                        if st.button("重新启用", key=f"on_{slug}"):
-                            ok, err = set_teacher_active(slug, True)
-                            if ok:
-                                st.success("已启用。")
-                                st.rerun()
-                            else:
-                                st.error(err)
-                st.divider()
-                with st.form(f"admin_rename_{slug}"):
-                    st.caption("改登录账号或显示名（数据库和名册一起改，改完用新账号登录，密码不变）")
-                    rn = st.text_input(
-                        "登录账号", value=str(entry.get("username") or ""), key=f"rename_user_{slug}"
-                    )
-                    rd = st.text_input(
-                        "显示名", value=str(entry.get("display_name") or ""),
-                        placeholder="总后台里怎么称呼他", key=f"rename_display_{slug}",
-                    )
-                    nsub = st.form_submit_button("保存账号")
-                if nsub:
-                    ok, err = rename_teacher(slug, rn, rd)
-                    if ok:
-                        st.session_state[f"admin_rename_done_{slug}"] = str(rn).strip()
-                        if slug == my_slug:
-                            # 改的是自己：同步会话里的登录名，避免被踢回登录页
-                            st.session_state["auth_username"] = str(rn).strip()
-                        st.rerun()
-                    else:
-                        st.error(err)
-                renamed = st.session_state.pop(f"admin_rename_done_{slug}", None)
-                if renamed:
-                    st.success(
-                        f"已改好。以后用「{renamed}」登录（密码不变）。"
-                        "如果是你自己的账号，下次登录请用新账号。"
-                    )
+                    if st.button("重新启用", key=f"on_{slug}"):
+                        ok, err = set_teacher_active(slug, True)
+                        if ok:
+                            st.success("已启用。")
+                            st.rerun()
+                        else:
+                            st.error(err)
+            st.divider()
+            with st.form(f"admin_rename_{slug}"):
+                st.caption("改登录账号或显示名（数据库和名册一起改，改完用新账号登录，密码不变）")
+                rn = st.text_input(
+                    "登录账号", value=str(entry.get("username") or ""), key=f"rename_user_{slug}"
+                )
+                rd = st.text_input(
+                    "显示名", value=str(entry.get("display_name") or ""),
+                    placeholder="账号管理里怎么称呼他", key=f"rename_display_{slug}",
+                )
+                nsub = st.form_submit_button("保存账号")
+            if nsub:
+                ok, err = rename_teacher(slug, rn, rd)
+                if ok:
+                    st.session_state[f"admin_rename_done_{slug}"] = str(rn).strip()
+                    if slug == my_slug:
+                        # 改的是自己：同步会话里的登录名，避免被踢回登录页
+                        st.session_state["auth_username"] = str(rn).strip()
+                    st.rerun()
+                else:
+                    st.error(err)
+            renamed = st.session_state.pop(f"admin_rename_done_{slug}", None)
+            if renamed:
+                st.success(
+                    f"已改好。以后用「{renamed}」登录（密码不变）。"
+                    "如果是你自己的账号，下次登录请用新账号。"
+                )
 
-                st.divider()
-                with st.form(f"admin_reset_{slug}"):
-                    newpwd = st.text_input(
-                        "重置他的登录密码", placeholder="留空自动生成", key=f"reset_pwd_{slug}"
-                    )
-                    rsub = st.form_submit_button("重置密码")
-                if rsub:
-                    pwd = str(newpwd or "").strip() or um.generate_password()
-                    ok, err = reset_teacher_password(slug, pwd)
-                    if ok:
-                        st.session_state[f"admin_reset_done_{slug}"] = pwd
-                        st.rerun()
-                    else:
-                        st.error(err)
-                reset_done = st.session_state.pop(f"admin_reset_done_{slug}", None)
-                if reset_done:
-                    st.success("已重置，请把这组信息发给他（关掉就看不到了）")
-                    st.code(
-                        f"登录账号：{entry.get('username')}\n新密码：{reset_done}",
-                        language=None,
-                    )
-                st.caption("提示：这里只提供停用，不提供删除——删数据不可逆，需要时再单独处理。")
+            st.divider()
+            with st.form(f"admin_reset_{slug}"):
+                newpwd = st.text_input(
+                    "重置他的登录密码", placeholder="留空自动生成", key=f"reset_pwd_{slug}"
+                )
+                rsub = st.form_submit_button("重置密码")
+            if rsub:
+                pwd = str(newpwd or "").strip() or um.generate_password()
+                ok, err = reset_teacher_password(slug, pwd)
+                if ok:
+                    st.session_state[f"admin_reset_done_{slug}"] = pwd
+                    st.rerun()
+                else:
+                    st.error(err)
+            reset_done = st.session_state.pop(f"admin_reset_done_{slug}", None)
+            if reset_done:
+                st.success("已重置，请把这组信息发给他（关掉就看不到了）")
+                st.code(
+                    f"登录账号：{entry.get('username')}\n新密码：{reset_done}",
+                    language=None,
+                )
+            st.caption("提示：这里只提供停用，不提供删除——删数据不可逆，需要时再单独处理。")

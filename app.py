@@ -41,6 +41,7 @@ if _MISSING_API:
 
 import admin_console
 import course_management as cm
+import impersonation
 import platform_store
 import teacher_registry
 import ui_theme
@@ -54,7 +55,12 @@ platform_store.configure(BASE / "data")
 # 每位老师一份独立数据库：已登录时按登录名定位到他那一份；
 # 未登录时只准备名册(几 KB)，不下载任何老师的数据库。
 SESSION_SLUG = teacher_registry.session_slug()
-ACTIVE_SLUG = SESSION_SLUG or cloud_store.DEFAULT_SLUG
+_IMPERSONATION_STATE = impersonation.peek()
+ACTIVE_SLUG = (
+    str(_IMPERSONATION_STATE.get("teacher_slug") or "")
+    if _IMPERSONATION_STATE
+    else ""
+) or SESSION_SLUG or cloud_store.DEFAULT_SLUG
 DATA = cloud_store.get_data_dir(BASE / "data", ACTIVE_SLUG)
 PHOTOS = DATA / "photos"
 DB = DATA / "scores.db"
@@ -151,6 +157,7 @@ def _clean(params):
 
 
 def run(sql, params=()):
+    platform_store.assert_content_write_allowed()
     conn = sqlite3.connect(_session_db_path())
     try:
         cur = conn.execute(sql, _clean(params))
@@ -162,6 +169,7 @@ def run(sql, params=()):
 
 
 def query(sql, params=()):
+    platform_store.assert_content_read_allowed()
     conn = sqlite3.connect(_session_db_path())
     try:
         return pd.read_sql_query(sql, conn, params=_clean(params))
@@ -371,6 +379,7 @@ def week_start(d):
 
 
 def save_photos(files, tag):
+    platform_store.assert_content_write_allowed()
     names = []
     photos_dir = _session_photos_dir()
     for f in files or []:
@@ -1779,8 +1788,14 @@ def page_exams():
 
 
 # ==================== 登录 & 导航 ====================
-def activate_database(slug: str) -> tuple[bool, str]:
-    """把当前会话切到指定老师的数据库：定位路径 → 只下载他那一份 → 建表。"""
+def activate_database(
+    slug: str, *, initialize_content: bool = True
+) -> tuple[bool, str]:
+    """把当前会话切到指定老师的数据库：定位路径 → 只下载他那一份 → 建表。
+
+    平台管理员默认只使用账号表，不初始化或读取课程业务表；需要查看老师内容时
+    必须走临时只读代入。
+    """
     global DATA, PHOTOS, DB
     data_dir = cloud_store.get_data_dir(BASE / "data", slug)
     photos = data_dir / "photos"
@@ -1796,9 +1811,10 @@ def activate_database(slug: str) -> tuple[bool, str]:
     if cloud_store.is_cloud() and not found:
         return False, "这位老师的数据还没有初始化，请联系管理员。"
     DATA, PHOTOS, DB = data_dir, photos, db
-    init_db()
-    cm.configure(DB)
-    cm.init_course_db(DB)
+    if initialize_content:
+        init_db()
+        cm.configure(DB)
+        cm.init_course_db(DB)
     um.configure(DB)
     org_id = platform_store.org_id_for_slug(slug)
     try:
@@ -1809,16 +1825,50 @@ def activate_database(slug: str) -> tuple[bool, str]:
         )
     except RuntimeError as exc:
         return False, str(exc)
+    if not platform_store.is_impersonating():
+        st.session_state["auth_db_path"] = str(db)
+        st.session_state["auth_db_slug"] = slug
     # 把这位老师库里的登录名同步进名册，新开的学生账号马上就能登录
     teacher_registry.note_usernames(slug, DB)
-    # 顺手把自己的汇总上报给名册（每次会话只做一次），总后台就不用挨个下载所有人的库
-    if not st.session_state.get("_stats_reported"):
+    # 顺手把自己的汇总上报给名册（每次会话只做一次），平台概览就不用挨个下载所有人的库
+    if initialize_content and not st.session_state.get("_stats_reported"):
         try:
             teacher_registry.note_stats(slug, DB)
         except Exception:
             pass
         st.session_state["_stats_reported"] = True
     return True, ""
+
+
+def activate_impersonation_database(state: dict) -> tuple[bool, str]:
+    """只读代入时加载目标老师的数据库，不执行任何迁移或初始化写入。"""
+    global DATA, PHOTOS, DB
+    slug = cloud_store.normalize_slug(state.get("teacher_slug")) or cloud_store.DEFAULT_SLUG
+    data_dir = cloud_store.get_data_dir(BASE / "data", slug)
+    photos = data_dir / "photos"
+    photos.mkdir(parents=True, exist_ok=True)
+    db = data_dir / "scores.db"
+    try:
+        found = cloud_store.prepare_database(db, cloud_store.db_object_path(slug))
+    except Exception as exc:
+        return False, f"无法读取代入查看的数据：{exc}"
+    if cloud_store.is_cloud() and not found:
+        return False, "这位老师的数据暂时不可用。"
+    if not db.is_file():
+        return False, "这位老师的数据暂时不可用。"
+    cloud_store.set_session_slug(slug)
+    st.session_state["db_slug"] = slug
+    st.session_state["db_path"] = str(db)
+    DATA, PHOTOS, DB = data_dir, photos, db
+    cm.configure(DB)
+    um.configure(DB)
+    return True, ""
+
+
+def _is_platform_admin_slug(slug: str) -> bool:
+    """按老师名册判断当前账号是否平台管理员，不读取业务内容。"""
+    entry = teacher_registry.teacher_entry(slug) or {}
+    return bool(entry.get("is_admin"))
 
 
 def route_login(username: str) -> str:
@@ -1850,7 +1900,10 @@ def route_login(username: str) -> str:
             print(f"[app] 写登录审计失败：{exc}", file=sys.stderr)
         # 和「密码错误」用同一句提示，不泄露账号是否存在
         return "账号或密码错误"
-    ok, error = activate_database(slug)
+    ok, error = activate_database(
+        slug,
+        initialize_content=not _is_platform_admin_slug(slug),
+    )
     if not ok:
         try:
             platform_store.record_audit(
@@ -1873,7 +1926,13 @@ if SESSION_SLUG is None:
     um.render_login()
     st.stop()
 
-ok, activate_error = activate_database(SESSION_SLUG)
+if _IMPERSONATION_STATE:
+    ok, activate_error = activate_impersonation_database(_IMPERSONATION_STATE)
+else:
+    ok, activate_error = activate_database(
+        SESSION_SLUG,
+        initialize_content=not _is_platform_admin_slug(SESSION_SLUG),
+    )
 if not ok:
     st.error(activate_error)
     st.stop()
@@ -1916,21 +1975,39 @@ if not st.session_state.get("_platform_login_audited"):
         print(f"[app] 写登录审计失败：{exc}", file=sys.stderr)
     st.session_state["_platform_login_audited"] = True
 
+active_impersonation = impersonation.ensure_active()
+if active_impersonation:
+    st.markdown(
+        '<div class="impersonation-banner">'
+        + impersonation.banner_text(active_impersonation)
+        + "</div>",
+        unsafe_allow_html=True,
+    )
+    remaining_ms = max(1, impersonation.remaining_seconds(active_impersonation)) * 1000
+    components.html(
+        f"""<script>
+        setTimeout(function () {{
+          try {{ window.parent.location.reload(); }}
+          catch (e) {{ window.location.reload(); }}
+        }}, {remaining_ms});
+        </script>""",
+        height=0,
+    )
+
 um.render_sidebar_identity()
+if active_impersonation:
+    if st.sidebar.button(
+        "结束代入查看",
+        use_container_width=True,
+        key="end_impersonation",
+    ):
+        impersonation.end("manual")
+
 if int(user.get("must_change_password") or 0) == 1:
     um.page_account(force_change=True)
     st.stop()
 
 if user["role"] == um.ROLE_TEACHER:
-    PAGES = {
-        "首页": cm.page_home,
-        "课程表": cm.page_schedule,
-        "教学对象": cm.page_targets,
-        "学生": page_students,
-        "授课统计": cm.page_stats,
-        "考试成绩": page_exams,
-    }
-    # 只有创始者能开账号（老师账号和学生账号都是）；其他老师看不到「账号管理」
     IS_ADMIN = bool((teacher_registry.teacher_entry(SESSION_SLUG) or {}).get("is_admin"))
     org_member = platform_store.org_user_for_slug(SESSION_SLUG)
     org = platform_store.get_organization(
@@ -1942,19 +2019,39 @@ if user["role"] == um.ROLE_TEACHER:
         and org
         and org.get("kind") != "个人"
     )
-    if IS_ADMIN:
-        PAGES["账号管理"] = um.page_user_admin
-        PAGES["平台概览"] = admin_console.page_platform_overview
-        PAGES["总后台"] = admin_console.page_admin
-    elif teacher_registry.get_setting(
-        teacher_registry.SETTING_TEACHERS_CAN_CREATE_STUDENTS, False
-    ):
-        # 总后台把开关打开了：老师可以给自己的学生开账号、重置密码，
-        # 但没有删除入口（删除不可逆，留给总管理员）
-        PAGES["账号管理"] = lambda: um.page_user_admin(allow_delete=False)
-    if IS_ORG_ADMIN:
-        PAGES["机构管理"] = admin_console.page_org_admin
-    PAGES["账号"] = um.page_account
+    if active_impersonation:
+        PAGES = {
+            "首页": cm.page_home,
+            "课程表": cm.page_schedule,
+            "教学对象": cm.page_targets,
+            "学生": page_students,
+            "授课统计": cm.page_stats,
+            "考试成绩": page_exams,
+        }
+    elif IS_ADMIN:
+        PAGES = {
+            "平台概览": admin_console.page_platform_overview,
+            "账号管理": admin_console.page_admin,
+            "账号": um.page_account,
+        }
+    else:
+        PAGES = {
+            "首页": cm.page_home,
+            "课程表": cm.page_schedule,
+            "教学对象": cm.page_targets,
+            "学生": page_students,
+            "授课统计": cm.page_stats,
+            "考试成绩": page_exams,
+        }
+        if teacher_registry.get_setting(
+            teacher_registry.SETTING_TEACHERS_CAN_CREATE_STUDENTS, False
+        ):
+            # 平台管理把开关打开了：老师可以给自己的学生开账号、重置密码，
+            # 但没有删除入口（删除不可逆，留给总管理员）
+            PAGES["账号管理"] = lambda: um.page_user_admin(allow_delete=False)
+        if IS_ORG_ADMIN:
+            PAGES["机构管理"] = admin_console.page_org_admin
+        PAGES["账号"] = um.page_account
 else:
     PAGES = {
         "我的课程": um.page_student_courses,
@@ -2019,12 +2116,16 @@ def page_me() -> None:
 
 if user["role"] == um.ROLE_TEACHER:
     NAV = dict(PAGES)
-    if cm.is_mobile():
+    if cm.is_mobile() and (active_impersonation or not IS_ADMIN):
         NAV["我的"] = page_me          # 待办提醒 / 课时预警 / 本月速览
 else:
     NAV = dict(PAGES)
 
 nav_options = list(NAV)
+pending_page = st.session_state.pop(impersonation.PENDING_PAGE_KEY, None)
+if pending_page in nav_options:
+    # 必须在导航 radio 创建之前设置；页面内的表单提交时不能直接改这个控件。
+    st.session_state["page"] = pending_page
 if st.session_state.get("page") not in nav_options:
     # 权限变化后残留的旧页面名，兜底回到第一项，避免报错
     st.session_state["page"] = nav_options[0]

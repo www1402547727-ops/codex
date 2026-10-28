@@ -310,6 +310,14 @@ def save_database(db_path: str | Path, object_path: str | None = None) -> None:
     """把本地数据库同步到云端。内容没变就不上传(页面每次刷新都会调用到这里)。"""
     if not is_cloud():
         return
+    try:
+        import platform_store
+
+        platform_store.assert_write_allowed()
+    except PermissionError:
+        raise
+    except Exception:
+        pass
     path = Path(db_path)
     if not path.is_file():
         return

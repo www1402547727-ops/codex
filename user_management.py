@@ -17,6 +17,8 @@ import pandas as pd
 import streamlit as st
 
 import cloud_store
+import impersonation
+import platform_store
 
 
 DB_PATH = Path(__file__).parent / "data" / "scores.db"
@@ -50,12 +52,23 @@ def _db_path() -> Path:
     return Path(DB_PATH)
 
 
+def _auth_db_path() -> Path:
+    """账号身份所在的库；代入查看时仍指向管理员自己的库。"""
+    try:
+        path = st.session_state.get("auth_db_path")
+        if path:
+            return Path(path)
+    except Exception:
+        pass
+    return _db_path()
+
+
 def _connect(db_path: str | Path | None = None) -> sqlite3.Connection:
     """默认连当前会话的库；显式传路径时连那个库（总后台操作别人的库时用）。"""
     target = Path(db_path) if db_path is not None else _db_path()
     conn = sqlite3.connect(target, timeout=15)
     conn.row_factory = sqlite3.Row
-    return conn
+    return platform_store.guard_connection(conn)
 
 
 def _clean(params):
@@ -479,12 +492,17 @@ def _get_user_by_username(username: str):
 
 
 def _get_user(user_id: int):
-    df = query(
-        """SELECT u.*, s.name AS student_name
-           FROM users u LEFT JOIN students s ON s.id=u.student_id
-           WHERE u.id=? LIMIT 1""",
-        (int(user_id),),
-    )
+    conn = _connect(_auth_db_path())
+    try:
+        df = pd.read_sql_query(
+            """SELECT u.*, s.name AS student_name
+               FROM users u LEFT JOIN students s ON s.id=u.student_id
+               WHERE u.id=? LIMIT 1""",
+            conn,
+            params=(int(user_id),),
+        )
+    finally:
+        conn.close()
     return None if df.empty else df.iloc[0]
 
 
@@ -559,7 +577,8 @@ def logout() -> None:
         "auth_user_id", "auth_username", "auth_role", "auth_student_id",
         "auth_actor_role", "auth_org_id", "_platform_login_audited", "page",
         # 退出后必须一并清掉「当前用哪份库」，否则换账号登录可能残留上一位老师的数据
-        "db_path", "db_slug",
+        "db_path", "db_slug", "auth_db_path", "auth_db_slug",
+        platform_store.IMPERSONATION_KEY, impersonation.PENDING_PAGE_KEY,
     ):
         st.session_state.pop(key, None)
     st.rerun()

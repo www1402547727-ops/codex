@@ -17,6 +17,7 @@ import sys
 import threading
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import cloud_store
 
@@ -37,6 +38,21 @@ DEFAULT_ORG_NAME = "默认机构"
 
 _lock = threading.RLock()
 _base_dir: Path | None = None
+IMPERSONATION_KEY = "impersonation"
+
+_WRITE_KEYWORDS = {
+    "insert",
+    "update",
+    "delete",
+    "replace",
+    "create",
+    "alter",
+    "drop",
+    "vacuum",
+    "attach",
+    "detach",
+    "reindex",
+}
 
 
 def configure(base_dir: str | Path) -> None:
@@ -197,6 +213,121 @@ def ensure_ready(teachers: list[dict] | None = None) -> int:
 
 def _row_dict(row: sqlite3.Row | None) -> dict | None:
     return dict(row) if row is not None else None
+
+
+# ==================== 只读代入 / 内容访问闸门 ====================
+def _session_get(name: str, default=None):
+    if st is None:
+        return default
+    try:
+        return st.session_state.get(name, default)
+    except Exception:
+        return default
+
+
+def current_impersonation() -> dict | None:
+    value = _session_get(IMPERSONATION_KEY)
+    return value if isinstance(value, dict) else None
+
+
+def is_impersonating() -> bool:
+    return current_impersonation() is not None
+
+
+def _first_sql_keyword(sql: str) -> str:
+    text = str(sql or "").lstrip()
+    while text.startswith("--"):
+        newline = text.find("\n")
+        if newline < 0:
+            return ""
+        text = text[newline + 1 :].lstrip()
+    while text.startswith("/*"):
+        end = text.find("*/")
+        if end < 0:
+            return ""
+        text = text[end + 2 :].lstrip()
+    return text.split(None, 1)[0].lower().strip(";") if text else ""
+
+
+def is_write_sql(sql: str) -> bool:
+    keyword = _first_sql_keyword(sql)
+    if keyword in _WRITE_KEYWORDS:
+        return True
+    if keyword == "pragma":
+        return "=" in str(sql)
+    return False
+
+
+def assert_write_allowed() -> None:
+    """代入查看期间，所有业务库写入都从这里统一拒绝。"""
+    if is_impersonating():
+        raise PermissionError("代入查看为只读模式，不能修改任何数据。")
+
+
+def assert_content_read_allowed() -> None:
+    """平台管理员未代入时，不允许读取任何老师/学生内容。"""
+    actor_role = str(_session_get("auth_actor_role", "") or "")
+    if actor_role == "platform_admin" and not is_impersonating():
+        raise PermissionError("平台管理员需要先通过「临时只读查看」进入老师数据。")
+
+
+def assert_content_write_allowed() -> None:
+    """内容页写入只允许普通老师；平台管理员即使代入也不能写。"""
+    actor_role = str(_session_get("auth_actor_role", "") or "")
+    if actor_role == "platform_admin":
+        if is_impersonating():
+            raise PermissionError("代入查看为只读模式，不能修改任何数据。")
+        raise PermissionError("平台管理员不能直接修改老师数据。")
+
+
+class GuardedConnection:
+    """SQLite 连接包装器：在统一位置拦截代入期间的写语句。
+
+    content_scope=True 时，还会阻止平台管理员未代入就读取内容数据。
+    """
+
+    def __init__(self, conn: sqlite3.Connection, *, content_scope: bool = False):
+        self._conn = conn
+        self._content_scope = bool(content_scope)
+
+    def _before(self, sql: str) -> None:
+        if self._content_scope:
+            assert_content_read_allowed()
+        if is_write_sql(sql):
+            assert_write_allowed()
+
+    def execute(self, sql: str, parameters=()):
+        self._before(sql)
+        return self._conn.execute(sql, parameters)
+
+    def executemany(self, sql: str, parameters):
+        self._before(sql)
+        return self._conn.executemany(sql, parameters)
+
+    def executescript(self, sql_script: str):
+        if self._content_scope:
+            assert_content_read_allowed()
+        if is_impersonating():
+            assert_write_allowed()
+        elif is_write_sql(sql_script):
+            assert_write_allowed()
+        return self._conn.executescript(sql_script)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._conn, name)
+
+    def __enter__(self):
+        self._conn.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return self._conn.__exit__(exc_type, exc, traceback)
+
+
+def guard_connection(
+    conn: sqlite3.Connection, *, content_scope: bool = False
+) -> GuardedConnection:
+    return GuardedConnection(conn, content_scope=content_scope)
 
 
 def list_organizations() -> list[dict]:
