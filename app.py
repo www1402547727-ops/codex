@@ -41,6 +41,7 @@ if _MISSING_API:
 
 import admin_console
 import course_management as cm
+import demo_org
 import impersonation
 import platform_store
 import teacher_registry
@@ -362,6 +363,7 @@ def init_db(db_path=None, object_path=None):
 
 # 总后台要给新老师建库，得复用这里的建表逻辑（用回调避免循环 import）
 admin_console.configure(init_db)
+demo_org.configure(init_db)
 
 
 # ==================== 工具函数 ====================

@@ -24,6 +24,7 @@ import streamlit as st
 
 import cloud_store
 import course_management as cm
+import demo_org
 import impersonation
 import platform_store
 import teacher_registry
@@ -1252,7 +1253,7 @@ def create_student_account(
 # ==================== 页面 ====================
 def page_platform_overview() -> None:
     """平台管理员专用的运营概览，不展示任何学生内容。"""
-    _require_admin("平台概览")
+    my_slug = _require_admin("平台概览")
     st.title("平台概览")
     st.caption(
         "这里只显示机构、账号数量和存储情况，不显示学生姓名、成绩或试卷内容。"
@@ -1261,46 +1262,107 @@ def page_platform_overview() -> None:
     rows = build_platform_overview()
     if not rows:
         st.info("还没有机构记录。")
-        return
+    else:
+        total_teachers = sum(int(row["teacher_count"]) for row in rows)
+        total_students = sum(int(row["student_count"]) for row in rows)
+        total_courses = sum(int(row["course_count_30d"]) for row in rows)
+        total_exams = sum(int(row["exam_count"]) for row in rows)
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("机构", len(rows))
+        m2.metric("老师", total_teachers)
+        m3.metric("学生", total_students)
+        m4.metric("近 30 天课程", total_courses)
+        m5.metric("考试", total_exams)
 
-    total_teachers = sum(int(row["teacher_count"]) for row in rows)
-    total_students = sum(int(row["student_count"]) for row in rows)
-    total_courses = sum(int(row["course_count_30d"]) for row in rows)
-    total_exams = sum(int(row["exam_count"]) for row in rows)
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("机构", len(rows))
-    m2.metric("老师", total_teachers)
-    m3.metric("学生", total_students)
-    m4.metric("近 30 天课程", total_courses)
-    m5.metric("考试", total_exams)
+        table = pd.DataFrame(
+            [
+                {
+                    "机构": row["name"],
+                    "类型": row["kind"],
+                    "状态": row["status"],
+                    "老师数": row["teacher_count"],
+                    "学生数": row["student_count"],
+                    "近30天课程": row["course_count_30d"],
+                    "考试数": row["exam_count"],
+                    "最近登录": _ago(row["last_login"]),
+                    "照片/PDF": (
+                        "暂时无法统计"
+                        if row["media_count"] is None
+                        else f"{row['media_count']} 个 · {_format_bytes(row['media_bytes'])}"
+                    ),
+                    "创建时间": row["created_at"] or "—",
+                    "读取状态": (
+                        "部分统计暂不可用"
+                        if row["read_error"] or row["media_error"]
+                        else "正常"
+                    ),
+                }
+                for row in rows
+            ]
+        )
+        st.dataframe(table, hide_index=True, use_container_width=True)
 
-    table = pd.DataFrame(
-        [
-            {
-                "机构": row["name"],
-                "类型": row["kind"],
-                "状态": row["status"],
-                "老师数": row["teacher_count"],
-                "学生数": row["student_count"],
-                "近30天课程": row["course_count_30d"],
-                "考试数": row["exam_count"],
-                "最近登录": _ago(row["last_login"]),
-                "照片/PDF": (
-                    "暂时无法统计"
-                    if row["media_count"] is None
-                    else f"{row['media_count']} 个 · {_format_bytes(row['media_bytes'])}"
+    st.divider()
+    st.subheader("演示机构与使用摘要")
+    demo_col, summary_col = st.columns(2)
+    with demo_col:
+        st.markdown("**演示机构**")
+        st.caption(
+            "一键清空并重建一套虚构的课程、学生、成绩和账号，适合给其他机构体验。"
+            "账号密码随机生成，只显示一次。"
+        )
+        if st.button(
+            "重置演示机构",
+            use_container_width=True,
+            key="platform_reset_demo",
+        ):
+            try:
+                with st.spinner("正在重建演示数据..."):
+                    ok, err, credentials = demo_org.reset_demo(my_slug)
+                if ok:
+                    st.session_state["demo_credentials_once"] = credentials
+                    st.rerun()
+                else:
+                    st.error(err)
+            except Exception as exc:
+                st.error(f"重置演示机构失败：{exc}")
+        credentials = st.session_state.pop("demo_credentials_once", None)
+        if isinstance(credentials, dict):
+            st.success("演示机构已重建。下面的账号密码关闭或刷新后不再显示。")
+            st.code(
+                "老师账号：{teacher_username}\n老师密码：{teacher_password}\n"
+                "学生账号：{student_username}\n学生密码：{student_password}".format(
+                    **credentials
                 ),
-                "创建时间": row["created_at"] or "—",
-                "读取状态": (
-                    "部分统计暂不可用"
-                    if row["read_error"] or row["media_error"]
-                    else "正常"
-                ),
-            }
-            for row in rows
-        ]
-    )
-    st.dataframe(table, hide_index=True, use_container_width=True)
+                language=None,
+            )
+
+    with summary_col:
+        st.markdown("**对外使用摘要**")
+        st.caption(
+            "只导出机构数、老师数、累计课程数和考试数。"
+            "未授权公开名称的机构会合并成一行，不显示名称。"
+        )
+        if st.button(
+            "导出使用摘要",
+            use_container_width=True,
+            key="platform_export_summary",
+        ):
+            try:
+                data = demo_org.export_usage_summary(my_slug)
+                st.session_state["usage_summary_ready"] = data
+            except Exception as exc:
+                st.error(f"导出使用摘要失败：{exc}")
+        summary_data = st.session_state.get("usage_summary_ready")
+        if summary_data:
+            st.download_button(
+                "下载使用摘要 CSV",
+                data=summary_data,
+                file_name=f"平台使用摘要_{date.today().isoformat()}.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="platform_download_summary",
+            )
 
     st.divider()
     st.subheader("临时只读查看老师数据")
