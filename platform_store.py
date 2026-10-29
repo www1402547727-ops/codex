@@ -38,6 +38,7 @@ DEFAULT_ORG_NAME = "默认机构"
 
 _lock = threading.RLock()
 _base_dir: Path | None = None
+_recovery_blocked = False
 IMPERSONATION_KEY = "impersonation"
 
 _WRITE_KEYWORDS = {
@@ -56,8 +57,13 @@ _WRITE_KEYWORDS = {
 
 
 def configure(base_dir: str | Path) -> None:
-    global _base_dir
+    global _base_dir, _recovery_blocked
     _base_dir = Path(base_dir)
+    _recovery_blocked = False
+
+
+class PlatformStoreUnavailable(RuntimeError):
+    """平台库读取失败时，禁止任何本地初始化和云端覆盖。"""
 
 
 def _now() -> str:
@@ -67,10 +73,18 @@ def _now() -> str:
 def platform_db_path() -> Path:
     if _base_dir is None:
         raise RuntimeError("platform_store 还没有 configure")
+    if _recovery_blocked:
+        raise PlatformStoreUnavailable(
+            "平台库读取失败，已禁止初始化和上传，请刷新页面重试。"
+        )
     return _base_dir / "platform.db"
 
 
 def _connect(path: str | Path | None = None) -> sqlite3.Connection:
+    if _recovery_blocked:
+        raise PlatformStoreUnavailable(
+            "平台库读取失败，已禁止初始化、写入和上传，请刷新页面重试。"
+        )
     target = Path(path) if path is not None else platform_db_path()
     target.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(target, timeout=15)
@@ -85,6 +99,10 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition
 
 
 def _init_schema(conn: sqlite3.Connection) -> None:
+    if _recovery_blocked:
+        raise PlatformStoreUnavailable(
+            "平台库读取失败，已禁止初始化，请刷新页面重试。"
+        )
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS organizations(
@@ -141,6 +159,10 @@ def _init_schema(conn: sqlite3.Connection) -> None:
 
 
 def _save() -> None:
+    if _recovery_blocked:
+        raise PlatformStoreUnavailable(
+            "平台库读取失败，已禁止上传，请刷新页面重试。"
+        )
     path = platform_db_path()
     if path.is_file():
         cloud_store.save_database(path, cloud_store.platform_object_path())
@@ -152,13 +174,21 @@ def ensure_ready(teachers: list[dict] | None = None) -> int:
     这个函数可以重复执行：已有机构不会重复创建，已有老师不会重复插入。
     返回默认机构 id。
     """
+    global _recovery_blocked
     with _lock:
-        path = platform_db_path()
+        if _base_dir is None:
+            raise RuntimeError("platform_store 还没有 configure")
+        # 这里绕开 platform_db_path 的阻断检查，让下一次请求仍可重新尝试读取。
+        path = _base_dir / "platform.db"
         try:
             cloud_store.prepare_database(path, cloud_store.platform_object_path())
         except Exception as exc:
-            # 云端暂时不可用不应阻断本地老师登录；下一次保存时会再尝试同步。
+            _recovery_blocked = True
             print(f"[platform_store] 读取平台库失败：{exc}", file=sys.stderr)
+            raise PlatformStoreUnavailable(
+                "平台库读取失败，已停止初始化和上传，请刷新页面重试。"
+            ) from exc
+        _recovery_blocked = False
 
         conn = _connect(path)
         try:

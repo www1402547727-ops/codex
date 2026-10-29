@@ -32,15 +32,17 @@ DEFAULT_TEACHER_USERNAME = "teacher"
 _lock = threading.RLock()
 _base_dir: Path | None = None
 _roster: dict | None = None
+_remote_read_failed = False
 
 
 def configure(base_dir: str | Path) -> None:
     """告诉名册模块数据根目录在哪(由 app.py 调用)。"""
-    global _base_dir, _roster
-    base = Path(base_dir)
-    if _base_dir != base:
-        _base_dir = base
-        _roster = None
+    global _base_dir, _roster, _remote_read_failed
+    # 每次页面脚本运行都从云端重新确认一次；名册只有几 KB，
+    # 不能因为同一进程里留有旧缓存而掩盖本次读取失败。
+    _base_dir = Path(base_dir)
+    _roster = None
+    _remote_read_failed = False
 
 
 def _now() -> str:
@@ -97,23 +99,42 @@ def _read_local() -> dict | None:
 
 
 def _read_remote() -> dict | None:
+    global _remote_read_failed
     if not cloud_store.is_cloud():
         return None
     try:
         text = cloud_store.download_text(cloud_store.roster_object_path())
     except Exception as exc:
         print(f"[teacher_registry] 读取云端名册失败：{exc}", file=sys.stderr)
-        return None
-    if not text:
+        _remote_read_failed = True
+        raise RosterUnavailable(
+            "暂时读不到云端老师名册，已停止初始化和上传，请刷新页面重试。"
+        ) from exc
+    if text is None:
+        _remote_read_failed = False
         return None
     try:
-        return _normalize(json.loads(text))
-    except Exception:
-        return None
+        roster = _normalize(json.loads(text))
+    except Exception as exc:
+        _remote_read_failed = True
+        raise RosterUnavailable(
+            "云端老师名册内容无法读取，已停止初始化和上传，请刷新页面重试。"
+        ) from exc
+    if not _is_usable(roster):
+        _remote_read_failed = True
+        raise RosterUnavailable(
+            "云端老师名册没有可用账号，已停止初始化和上传，请联系维护人员。"
+        )
+    _remote_read_failed = False
+    return roster
 
 
 def save(roster: dict, strict: bool = False) -> None:
     global _roster
+    if cloud_store.is_cloud() and _remote_read_failed:
+        raise RosterUnavailable(
+            "云端老师名册读取失败，已禁止写入或上传，请刷新页面重试。"
+        )
     data = _normalize(roster)
     text = json.dumps(data, ensure_ascii=False, indent=2)
     path = roster_path()
@@ -138,9 +159,12 @@ def load(force: bool = False) -> dict:
     with _lock:
         if _roster is not None and not force:
             return _roster
-        data = _read_local()
-        if data is None:
+        if cloud_store.is_cloud():
             data = _read_remote()
+            if data is None:
+                data = _read_local()
+        else:
+            data = _read_local()
         if data is None:
             data = _empty_roster()
         _roster = data
@@ -207,10 +231,10 @@ def ensure_ready(db_path: str | Path) -> dict:
     """确保名册存在且可用；本地和云端都没有(或都不可用)时，按现有数据库生成一份。"""
     global _roster
     with _lock:
-        for candidate in (_read_local(), _read_remote()):
-            if _is_usable(candidate):
-                _roster = candidate
-                return _roster
+        candidate = load(force=True)
+        if _is_usable(candidate):
+            _roster = candidate
+            return _roster
     return bootstrap(db_path)
 
 

@@ -55,7 +55,11 @@ platform_store.configure(BASE / "data")
 # ==================== 定位当前会话用哪一份数据库 ====================
 # 每位老师一份独立数据库：已登录时按登录名定位到他那一份；
 # 未登录时只准备名册(几 KB)，不下载任何老师的数据库。
-SESSION_SLUG = teacher_registry.session_slug()
+try:
+    SESSION_SLUG = teacher_registry.session_slug()
+except teacher_registry.RosterUnavailable as exc:
+    st.error(str(exc))
+    st.stop()
 _IMPERSONATION_STATE = impersonation.peek()
 ACTIVE_SLUG = (
     str(_IMPERSONATION_STATE.get("teacher_slug") or "")
@@ -1803,22 +1807,25 @@ def activate_database(
     photos = data_dir / "photos"
     photos.mkdir(parents=True, exist_ok=True)
     db = data_dir / "scores.db"
+    ready, prepare_error = cloud_store.prepare_required_database(
+        db,
+        cloud_store.db_object_path(slug),
+    )
+    if not ready:
+        return False, prepare_error
     cloud_store.set_session_slug(slug)
     st.session_state["db_slug"] = slug
     st.session_state["db_path"] = str(db)
-    try:
-        found = cloud_store.prepare_database(db, cloud_store.db_object_path(slug))
-    except Exception as exc:
-        return False, f"无法读取云端数据库：{exc}"
-    if cloud_store.is_cloud() and not found:
-        return False, "这位老师的数据还没有初始化，请联系管理员。"
     DATA, PHOTOS, DB = data_dir, photos, db
     if initialize_content:
         init_db()
         cm.configure(DB)
         cm.init_course_db(DB)
     um.configure(DB)
-    org_id = platform_store.org_id_for_slug(slug)
+    try:
+        org_id = platform_store.org_id_for_slug(slug)
+    except platform_store.PlatformStoreUnavailable as exc:
+        return False, str(exc)
     try:
         um.init_user_db(
             DB,
@@ -1850,14 +1857,12 @@ def activate_impersonation_database(state: dict) -> tuple[bool, str]:
     photos = data_dir / "photos"
     photos.mkdir(parents=True, exist_ok=True)
     db = data_dir / "scores.db"
-    try:
-        found = cloud_store.prepare_database(db, cloud_store.db_object_path(slug))
-    except Exception as exc:
-        return False, f"无法读取代入查看的数据：{exc}"
-    if cloud_store.is_cloud() and not found:
-        return False, "这位老师的数据暂时不可用。"
-    if not db.is_file():
-        return False, "这位老师的数据暂时不可用。"
+    ready, prepare_error = cloud_store.prepare_required_database(
+        db,
+        cloud_store.db_object_path(slug),
+    )
+    if not ready:
+        return False, prepare_error
     cloud_store.set_session_slug(slug)
     st.session_state["db_slug"] = slug
     st.session_state["db_path"] = str(db)

@@ -291,6 +291,23 @@ def prepare_database(db_path: str | Path, object_path: str | None = None) -> boo
         return True
 
 
+def prepare_required_database(
+    db_path: str | Path,
+    object_path: str | None = None,
+) -> tuple[bool, str]:
+    """准备一份必须存在的数据库；读取失败与 404 都不允许继续初始化。"""
+    target = Path(db_path)
+    try:
+        found = prepare_database(target, object_path)
+    except Exception as exc:
+        return False, f"无法读取云端数据库：{exc}"
+    if is_cloud() and not found:
+        return False, "云端数据库文件不存在，已停止初始化。"
+    if not target.is_file():
+        return False, "本地数据库文件不存在，已停止初始化。"
+    return True, ""
+
+
 def _snapshot(path: Path) -> bytes:
     """用 SQLite 自带的在线备份接口拿一份一致的快照。
     直接 read_bytes() 读正在被别的会话写入的 .db 文件,可能读到写了一半的内容。"""
