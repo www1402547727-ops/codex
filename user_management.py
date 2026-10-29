@@ -31,8 +31,10 @@ LOGIN_LOCK_SECONDS = 10 * 60
 LOGIN_MAX_FAILURES = 5
 PASSWORD_ITERATIONS = 310_000
 PASSWORD_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
-NOTICE_VERSION = "v1"
-NOTICE_DATE = "2026-10-28"
+NOTICE_VERSION = "v2"
+NOTICE_DATE = "2026-10-29"
+GUARDIAN_CONSENT_VERSION = "v1"
+GUARDIAN_CONSENT_DATE = "2026-10-29"
 
 NOTICE_MARKDOWN = """
 ### 教务工作台 体验版说明
@@ -49,7 +51,7 @@ NOTICE_MARKDOWN = """
 - 不会用您的真实数据做宣传或展示。
 
 #### 4. 关于学生个人信息
-学生信息，尤其是未满 14 周岁学生的信息，受法律特别保护。录入前，请确认您（或您的机构）已取得学生监护人的同意。请只录入教学必需的信息，不要录入身份证号、住址等与教学无关的内容。
+学生信息，尤其是未满 14 周岁学生的信息，受法律特别保护。老师或机构为学生开登录账号时，必须确认已经取得学生监护人的同意，并记录同意时间。学生账号登录时不会要求学生本人同意本说明。请只录入教学必需的信息，不要录入身份证号、住址等与教学无关的内容。
 
 #### 5. 您的账号
 请妥善保管密码，不要与他人共用账号。发现异常登录，请立即联系我们。请确保您开展的教学活动符合当地有关规定。
@@ -323,15 +325,20 @@ def init_user_db(
                 detail TEXT DEFAULT '',
                 created_at TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS consent_records(
+            CREATE TABLE IF NOT EXISTS guardian_consent_records(
                 id INTEGER PRIMARY KEY,
-                user_id INTEGER NOT NULL,
+                student_user_id INTEGER NOT NULL,
+                student_username TEXT NOT NULL DEFAULT '',
+                student_id INTEGER NOT NULL,
+                teacher_user_id INTEGER,
+                teacher_username TEXT NOT NULL DEFAULT '',
+                org_id INTEGER,
                 version TEXT NOT NULL,
                 accepted_at TEXT NOT NULL,
-                UNIQUE(user_id, version)
+                UNIQUE(student_user_id, version)
             );
-            CREATE INDEX IF NOT EXISTS idx_consent_user
-                ON consent_records(user_id, accepted_at);
+            CREATE INDEX IF NOT EXISTS idx_guardian_consent_student
+                ON guardian_consent_records(student_user_id, accepted_at);
             """
         )
 
@@ -424,6 +431,10 @@ def create_account_in(
     must_change_password: bool = True,
     note: str = "",
     org_id: int | None = None,
+    guardian_consent: bool = False,
+    guardian_consent_version: str = GUARDIAN_CONSENT_VERSION,
+    actor_user_id: int | None = None,
+    actor_username: str = "",
 ) -> tuple[bool, str]:
     """在**指定**数据库里创建账号（总后台替某位老师开账号时用）。
 
@@ -438,6 +449,10 @@ def create_account_in(
         return False, "初始密码至少 6 位"
     if role not in (ROLE_TEACHER, ROLE_STUDENT):
         return False, "身份不合法"
+    if role == ROLE_STUDENT and student_id is None:
+        return False, "请选择要绑定账号的学生"
+    if role == ROLE_STUDENT and not guardian_consent:
+        return False, "请先确认已取得学生监护人同意"
     conn = _connect(target)
     try:
         if conn.execute("SELECT 1 FROM users WHERE username=? COLLATE NOCASE", (name,)).fetchone():
@@ -448,7 +463,7 @@ def create_account_in(
             ).fetchone()
             if bound:
                 return False, f"这位学生已经有账号了（{bound['username']}）"
-        conn.execute(
+        cur = conn.execute(
             """INSERT INTO users(username, password_hash, role, org_id, student_id, active,
                                  must_change_password, created_at, note)
                VALUES(?,?,?,?,?,1,?,?,?)""",
@@ -463,6 +478,24 @@ def create_account_in(
                 note,
             ),
         )
+        if role == ROLE_STUDENT:
+            conn.execute(
+                """INSERT OR IGNORE INTO guardian_consent_records(
+                       student_user_id, student_username, student_id,
+                       teacher_user_id, teacher_username, org_id,
+                       version, accepted_at
+                   ) VALUES(?,?,?,?,?,?,?,?)""",
+                (
+                    int(cur.lastrowid),
+                    name,
+                    int(student_id) if student_id is not None else 0,
+                    int(actor_user_id) if actor_user_id is not None else None,
+                    str(actor_username or "").strip(),
+                    int(org_id) if org_id is not None else None,
+                    str(guardian_consent_version or GUARDIAN_CONSENT_VERSION),
+                    _now(),
+                ),
+            )
         conn.commit()
     finally:
         conn.close()
@@ -657,19 +690,53 @@ def has_accepted_notice(
     *,
     db_path: str | Path | None = None,
     version: str = NOTICE_VERSION,
+    username: str | None = None,
 ) -> bool:
     """检查账号是否同意过当前版本的说明；只读指定库，不跨会话猜路径。"""
-    target = Path(db_path) if db_path is not None else _auth_db_path()
-    conn = _connect(target)
+    name = str(username or "").strip()
+    if not name:
+        target = Path(db_path) if db_path is not None else _auth_db_path()
+        conn = _connect(target)
+        try:
+            row = conn.execute(
+                "SELECT username FROM users WHERE id=? LIMIT 1",
+                (int(user_id),),
+            ).fetchone()
+            name = str(row["username"] or "").strip() if row is not None else ""
+        finally:
+            conn.close()
+    if not name:
+        return False
+    return platform_store.has_accepted_teacher_notice(
+        name,
+        version=str(version),
+    )
+
+
+def is_platform_admin_account(
+    user: dict | None = None,
+    *,
+    db_slug: str | None = None,
+) -> bool:
+    """平台管理员不参与体验版说明确认。"""
+    current = user or current_user()
+    if not current or current.get("role") != ROLE_TEACHER:
+        return False
     try:
-        row = conn.execute(
-            """SELECT 1 FROM consent_records
-               WHERE user_id=? AND version=? LIMIT 1""",
-            (int(user_id), str(version)),
-        ).fetchone()
-        return row is not None
-    finally:
-        conn.close()
+        slug = (
+            db_slug
+            or st.session_state.get("db_slug")
+            or st.session_state.get("auth_db_slug")
+            or teacher_registry.session_slug()
+        )
+    except Exception:
+        slug = db_slug
+    if not slug:
+        return False
+    try:
+        return bool((teacher_registry.teacher_entry(slug) or {}).get("is_admin"))
+    except Exception:
+        return False
 
 
 def notice_required(
@@ -681,12 +748,24 @@ def notice_required(
     current = user or current_user()
     if not current or current.get("role") != ROLE_TEACHER:
         return False
+    if is_platform_admin_account(current):
+        return False
     if platform_store.is_impersonating():
         return False
     return not has_accepted_notice(
         int(current["id"]),
         db_path=db_path,
+        username=str(current.get("username") or ""),
     )
+
+
+def server_side_notice_allows_page(
+    user: dict | None = None,
+    *,
+    db_path: str | Path | None = None,
+) -> bool:
+    """页面入口的服务端闸门；未同意时任何业务页都不得继续渲染。"""
+    return not notice_required(user, db_path=db_path)
 
 
 def accept_notice(
@@ -702,26 +781,13 @@ def accept_notice(
     if platform_store.is_impersonating():
         return False, "代入查看期间不能修改任何数据"
 
-    target = Path(db_path) if db_path is not None else _auth_db_path()
     accepted_at = _now()
-    conn = _connect(target)
-    inserted = False
-    try:
-        cur = conn.execute(
-            """INSERT OR IGNORE INTO consent_records(user_id, version, accepted_at)
-               VALUES(?,?,?)""",
-            (int(user["id"]), str(version), accepted_at),
-        )
-        inserted = int(cur.rowcount or 0) > 0
-        conn.commit()
-    finally:
-        conn.close()
-
+    inserted = platform_store.accept_teacher_notice(
+        str(user.get("username") or ""),
+        version=str(version),
+        accepted_at=accepted_at,
+    )
     if inserted:
-        if db_path is None:
-            cloud_store.save_database(target)
-        else:
-            cloud_store.save_database(target, object_path)
         try:
             actor_role = str(
                 st.session_state.get("auth_actor_role")
@@ -744,7 +810,11 @@ def accept_notice(
     return True, ""
 
 
-def page_notice(require_acceptance: bool = False) -> None:
+def page_notice(
+    require_acceptance: bool = False,
+    *,
+    show_back: bool = False,
+) -> None:
     """体验版说明页；首次登录时作为必须通过的页面使用。"""
     user = current_user()
     if user is None:
@@ -757,9 +827,21 @@ def page_notice(require_acceptance: bool = False) -> None:
     st.markdown(NOTICE_MARKDOWN)
     st.caption(f"版本 {NOTICE_VERSION} · {NOTICE_DATE}")
 
-    accepted = has_accepted_notice(int(user["id"]))
+    if show_back and st.button("返回账号", use_container_width=True):
+        st.session_state.pop("view_notice", None)
+        st.session_state["page"] = "账号"
+        st.rerun()
+
+    accepted = has_accepted_notice(
+        int(user["id"]),
+        username=str(user.get("username") or ""),
+    )
     if accepted and not require_acceptance:
         st.success("当前账号已同意这一版说明。版本更新后会再次提示。")
+        return
+    if not require_acceptance:
+        st.info("当前账号还没有同意这一版说明，请在登录确认页完成同意。")
+        return
 
     if platform_store.is_impersonating():
         st.info("代入查看期间只能阅读说明，不能修改同意记录。")
@@ -918,6 +1000,14 @@ def page_account(force_change: bool = False) -> None:
             logout()
 
     st.divider()
+    if (
+        user["role"] == ROLE_TEACHER
+        and not is_platform_admin_account(user)
+    ):
+        if st.button("查看使用说明", use_container_width=True):
+            st.session_state["view_notice"] = True
+            st.rerun()
+        st.divider()
     st.subheader("关于数据权限")
     if user["role"] == ROLE_TEACHER:
         st.write("老师账号可以管理全部课程、学生、成绩和账号。")
@@ -930,6 +1020,10 @@ def _create_student_account(
     username: str,
     password: str,
     org_id: int | None = None,
+    *,
+    guardian_consent: bool = False,
+    actor_user_id: int | None = None,
+    actor_username: str = "",
 ) -> tuple[bool, str]:
     username = username.strip()
     valid, error = teacher_registry.validate_new_username(username)
@@ -945,22 +1039,21 @@ def _create_student_account(
         return False, "这个学生已经有账号"
     if not query("SELECT id FROM users WHERE username=? COLLATE NOCASE", (username,)).empty:
         return False, "这个账号名已经存在"
-    run(
-        """INSERT INTO users
-           (username, password_hash, role, org_id, student_id, active,
-            must_change_password, created_at)
-           VALUES(?,?,?,?,?,?,?,?)""",
-        (
-            username,
-            hash_password(password),
-            ROLE_STUDENT,
-            int(org_id) if org_id is not None else None,
-            int(student_id),
-            1,
-            1,
-            _now(),
-        ),
+    ok, error = create_account_in(
+        _db_path(),
+        username,
+        password,
+        ROLE_STUDENT,
+        student_id=int(student_id),
+        must_change_password=True,
+        org_id=org_id,
+        guardian_consent=guardian_consent,
+        actor_user_id=actor_user_id,
+        actor_username=actor_username,
     )
+    if not ok:
+        return False, error
+    cloud_store.save_database(_db_path())
     _audit(username, "student_account_created", f"student_id={int(student_id)}")
     try:
         import platform_store
@@ -1043,14 +1136,27 @@ def page_user_admin(allow_delete: bool = True) -> None:
                 student_id = st.selectbox("绑定学生", list(labels), format_func=labels.get)
                 username = st.text_input("账号", placeholder="例如：wx01 或学号")
                 password = st.text_input("初始密码", placeholder="留空自动生成")
+                guardian_confirmed = st.checkbox(
+                    "已取得学生监护人同意",
+                    help="未勾选不能创建学生账号；系统会记录操作老师和同意时间。",
+                )
                 submitted = st.form_submit_button("创建账号", type="primary")
             if submitted:
+                if not guardian_confirmed:
+                    st.error("请先确认已取得学生监护人同意")
+                    return
                 initial = password.strip() or generate_password()
                 org_id = user.get("org_id")
                 if pd.isna(org_id):
                     org_id = None
                 ok, error = _create_student_account(
-                    int(student_id), username, initial, int(org_id) if org_id is not None else None
+                    int(student_id),
+                    username,
+                    initial,
+                    int(org_id) if org_id is not None else None,
+                    guardian_consent=guardian_confirmed,
+                    actor_user_id=int(user["id"]),
+                    actor_username=str(user["username"]),
                 )
                 if ok:
                     st.session_state["account_created"] = {
@@ -1072,6 +1178,23 @@ def page_user_admin(allow_delete: bool = True) -> None:
         st.info("还没有账号")
         return
     show = users.copy()
+    guardian_rows = query(
+        "SELECT student_user_id FROM guardian_consent_records"
+    )
+    guardian_user_ids = {
+        int(value)
+        for value in guardian_rows.get("student_user_id", [])
+        if value is not None
+    }
+    show["监护人同意"] = show.apply(
+        lambda row: (
+            "已记录"
+            if str(row["role"]) == ROLE_STUDENT
+            and int(row["id"]) in guardian_user_ids
+            else ("未记录" if str(row["role"]) == ROLE_STUDENT else "—")
+        ),
+        axis=1,
+    )
     show["角色"] = show["role"].map(ROLE_LABELS).fillna(show["role"])
     show["状态"] = show["active"].map({1: "启用", 0: "停用"})
     show["绑定学生"] = show["student_name"].fillna("—")
@@ -1087,6 +1210,19 @@ def page_user_admin(allow_delete: bool = True) -> None:
         hide_index=True,
         use_container_width=True,
     )
+
+    guardian_missing = show[
+        (show["role"] == ROLE_STUDENT) & (show["监护人同意"] == "未记录")
+    ]
+    if not guardian_missing.empty:
+        st.caption("以下学生账号未记录监护人同意，请补办后再继续使用。")
+        st.dataframe(
+            guardian_missing[["username", "学生", "监护人同意"]].rename(
+                columns={"username": "账号", "学生": "学生"}
+            ),
+            hide_index=True,
+            use_container_width=True,
+        )
 
     student_users = users[users["role"] == ROLE_STUDENT].copy()
     if student_users.empty:

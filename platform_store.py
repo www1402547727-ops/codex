@@ -143,6 +143,14 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             ON audit_logs(org_id, at);
         CREATE INDEX IF NOT EXISTS idx_audit_actor_time
             ON audit_logs(actor_role, at);
+        CREATE TABLE IF NOT EXISTS teacher_notice_consents(
+            username TEXT NOT NULL COLLATE NOCASE,
+            version TEXT NOT NULL,
+            accepted_at TEXT NOT NULL,
+            PRIMARY KEY(username, version)
+        );
+        CREATE INDEX IF NOT EXISTS idx_teacher_notice_consents_user
+            ON teacher_notice_consents(username, accepted_at);
         CREATE TABLE IF NOT EXISTS system_errors(
             id INTEGER PRIMARY KEY,
             at TEXT NOT NULL,
@@ -535,6 +543,85 @@ def add_org_user(org_id: int, slug: str, role: str = ROLE_TEACHER) -> tuple[bool
             conn.close()
         _save()
         return True, ""
+
+
+def has_accepted_teacher_notice(
+    username: str,
+    *,
+    version: str,
+) -> bool:
+    """查询平台库中的老师说明同意记录。"""
+    clean_username = str(username or "").strip()
+    clean_version = str(version or "").strip()
+    if not clean_username or not clean_version:
+        return False
+    path = platform_db_path()
+    if not path.is_file():
+        return False
+    conn = _connect(path)
+    try:
+        _init_schema(conn)
+        row = conn.execute(
+            """SELECT 1 FROM teacher_notice_consents
+               WHERE username=? COLLATE NOCASE AND version=?
+               LIMIT 1""",
+            (clean_username, clean_version),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def accept_teacher_notice(
+    username: str,
+    *,
+    version: str,
+    accepted_at: str = "",
+) -> bool:
+    """写入平台库中的老师说明同意记录，重复提交保持幂等。"""
+    clean_username = str(username or "").strip()
+    clean_version = str(version or "").strip()
+    if not clean_username or not clean_version:
+        return False
+    with _lock:
+        conn = _connect()
+        try:
+            _init_schema(conn)
+            cur = conn.execute(
+                """INSERT OR IGNORE INTO teacher_notice_consents(
+                       username, version, accepted_at
+                   ) VALUES(?,?,?)""",
+                (
+                    clean_username,
+                    clean_version,
+                    str(accepted_at or _now()),
+                ),
+            )
+            inserted = int(cur.rowcount or 0) > 0
+            conn.commit()
+        finally:
+            conn.close()
+        if inserted:
+            _save()
+        return inserted
+
+
+def list_teacher_notice_consents() -> list[dict]:
+    """列出平台库中的老师说明同意记录，不读取老师业务数据。"""
+    path = platform_db_path()
+    if not path.is_file():
+        return []
+    conn = _connect(path)
+    try:
+        _init_schema(conn)
+        rows = conn.execute(
+            """SELECT username, version, accepted_at
+               FROM teacher_notice_consents
+               ORDER BY accepted_at, username"""
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
 
 
 def delete_organization_record(org_id: int) -> bool:

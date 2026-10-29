@@ -168,6 +168,8 @@ def _seed_teacher(path: Path, suffix: str, course_id: int) -> None:
         um.ROLE_STUDENT,
         student_id=student_id,
         must_change_password=False,
+        guardian_consent=True,
+        actor_username="isolation_teacher",
     )
 
 

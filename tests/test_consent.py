@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import tempfile
@@ -11,6 +12,7 @@ import streamlit as st
 
 import cloud_store
 import platform_store
+import teacher_registry
 import user_management as um
 
 
@@ -52,6 +54,7 @@ class ConsentTests(unittest.TestCase):
         finally:
             conn.close()
         platform_store.configure(self.base)
+        teacher_registry.configure(self.base)
         cloud_store.configure("", "")
         self.org_id = platform_store.ensure_ready([])
         um.init_user_db(
@@ -95,14 +98,48 @@ class ConsentTests(unittest.TestCase):
         return state
 
     def test_schema_and_first_login_requires_current_version(self):
-        conn = sqlite3.connect(self.db)
+        conn = sqlite3.connect(platform_store.platform_db_path())
         try:
             columns = {
-                row[1] for row in conn.execute("PRAGMA table_info(consent_records)")
+                row[1]
+                for row in conn.execute(
+                    "PRAGMA table_info(teacher_notice_consents)"
+                )
             }
         finally:
             conn.close()
-        self.assertTrue({"user_id", "version", "accepted_at"}.issubset(columns))
+        conn = sqlite3.connect(self.db)
+        try:
+            teacher_tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            guardian_columns = {
+                row[1]
+                for row in conn.execute(
+                    "PRAGMA table_info(guardian_consent_records)"
+                )
+            }
+        finally:
+            conn.close()
+        self.assertEqual(
+            columns,
+            {"username", "version", "accepted_at"},
+        )
+        self.assertNotIn("consent_records", teacher_tables)
+        self.assertTrue(
+            {
+                "student_user_id",
+                "student_username",
+                "student_id",
+                "teacher_user_id",
+                "teacher_username",
+                "version",
+                "accepted_at",
+            }.issubset(guardian_columns)
+        )
         with patch.object(st, "session_state", self._state()):
             self.assertTrue(um.notice_required(self.user, db_path=self.db))
 
@@ -123,11 +160,11 @@ class ConsentTests(unittest.TestCase):
             self.assertTrue(ok, err)
             self.assertFalse(um.notice_required(self.user, db_path=self.db))
 
-        conn = sqlite3.connect(self.db)
+        conn = sqlite3.connect(platform_store.platform_db_path())
         try:
             rows = conn.execute(
-                "SELECT version, accepted_at FROM consent_records WHERE user_id=?",
-                (int(self.user["id"]),),
+                "SELECT version, accepted_at FROM teacher_notice_consents WHERE username=?",
+                (self.user["username"],),
             ).fetchall()
         finally:
             conn.close()
@@ -154,7 +191,7 @@ class ConsentTests(unittest.TestCase):
         )
         self.assertTrue(
             not um.has_accepted_notice(
-                int(self.user["id"]), db_path=self.db, version="v2"
+                int(self.user["id"]), db_path=self.db, version="v3"
             )
         )
 
@@ -173,14 +210,120 @@ class ConsentTests(unittest.TestCase):
             )
         self.assertFalse(ok)
         self.assertIn("不能修改", err)
-        conn = sqlite3.connect(self.db)
+        conn = sqlite3.connect(platform_store.platform_db_path())
         try:
             count = int(
-                conn.execute("SELECT COUNT(*) FROM consent_records").fetchone()[0]
+                conn.execute(
+                    "SELECT COUNT(*) FROM teacher_notice_consents"
+                ).fetchone()[0]
             )
         finally:
             conn.close()
         self.assertEqual(count, 0)
+
+    def test_teacher_without_notice_cannot_access_any_page_before_acceptance(self):
+        with patch.object(st, "session_state", self._state()):
+            self.assertFalse(
+                um.server_side_notice_allows_page(self.user, db_path=self.db)
+            )
+            ok, err = um.accept_notice(
+                self.user,
+                db_path=self.db,
+                object_path=cloud_store.db_object_path("teacher"),
+            )
+            self.assertTrue(ok, err)
+            self.assertTrue(
+                um.server_side_notice_allows_page(self.user, db_path=self.db)
+            )
+
+    def test_platform_admin_does_not_need_notice(self):
+        roster = {
+            "teachers": [
+                {
+                    "username": self.user["username"],
+                    "slug": "teacher",
+                    "is_admin": True,
+                }
+            ],
+            "usernames": {self.user["username"]: "teacher"},
+        }
+        teacher_registry.configure(self.base)
+        (self.base / "teachers.json").write_text(
+            json.dumps(roster, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        state = self._state()
+        with patch.object(st, "session_state", state):
+            self.assertTrue(um.is_platform_admin_account(self.user))
+            self.assertFalse(um.notice_required(self.user, db_path=self.db))
+
+    def test_student_account_creation_rejects_without_guardian_consent_backend(self):
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute(
+                "INSERT INTO students(id,name,grade) VALUES(1,'虚构学生','初三')"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        ok, error = um.create_account_in(
+            self.db,
+            "student_without_guardian",
+            "student-password",
+            um.ROLE_STUDENT,
+            student_id=1,
+            guardian_consent=False,
+            actor_user_id=int(self.user["id"]),
+            actor_username=str(self.user["username"]),
+        )
+        self.assertFalse(ok)
+        self.assertIn("监护人", error)
+        conn = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM users WHERE username=?",
+                    ("student_without_guardian",),
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM guardian_consent_records"
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            conn.close()
+
+        ok, error = um.create_account_in(
+            self.db,
+            "student_with_guardian",
+            "student-password",
+            um.ROLE_STUDENT,
+            student_id=1,
+            guardian_consent=True,
+            actor_user_id=int(self.user["id"]),
+            actor_username=str(self.user["username"]),
+        )
+        self.assertTrue(ok, error)
+        conn = sqlite3.connect(self.db)
+        try:
+            row = conn.execute(
+                """SELECT student_username, student_id, teacher_user_id,
+                          teacher_username, version
+                   FROM guardian_consent_records
+                   WHERE student_username=?""",
+                ("student_with_guardian",),
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row[0], "student_with_guardian")
+        self.assertEqual(row[1], 1)
+        self.assertEqual(row[2], int(self.user["id"]))
+        self.assertEqual(row[3], self.user["username"])
+        self.assertEqual(row[4], um.GUARDIAN_CONSENT_VERSION)
 
 
 if __name__ == "__main__":

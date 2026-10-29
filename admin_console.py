@@ -481,6 +481,13 @@ def export_organization_zip(
     photo_loader = photo_loader or _teacher_photo_files
 
     teacher_rows: list[list[object]] = []
+    consent_exports = {
+        "guardian_consent_records": {
+            "filename": "监护人同意记录.csv",
+            "headers": None,
+            "rows": [],
+        },
+    }
     for member in members:
         slug = cloud_store.normalize_slug(member.get("slug")) or cloud_store.DEFAULT_SLUG
         entry = teacher_registry.teacher_entry(slug) or {}
@@ -572,6 +579,13 @@ def export_organization_zip(
                             ]
                             for row in rows
                         ]
+                    if table in consent_exports:
+                        exported = consent_exports[table]
+                        if exported["headers"] is None:
+                            exported["headers"] = ["老师标识", *headers]
+                        exported["rows"].extend(
+                            [[slug, *row] for row in rows]
+                        )
                     archive.writestr(
                         f"老师/{slug}/{safe_table}.csv",
                         _csv_bytes(headers, rows),
@@ -590,6 +604,15 @@ def export_organization_zip(
                 "照片清单.csv",
                 _csv_bytes(["老师标识", "文件名", "字节数"], photo_manifest),
             )
+        for exported in consent_exports.values():
+            if exported["headers"] is not None:
+                archive.writestr(
+                    str(exported["filename"]),
+                    _csv_bytes(
+                        list(exported["headers"]),
+                        list(exported["rows"]),
+                    ),
+                )
 
     _record_platform_audit(
         "export",
@@ -601,11 +624,52 @@ def export_organization_zip(
     return buffer.getvalue()
 
 
+def _db_table_count(db: Path, table: str) -> int:
+    if not db.is_file():
+        return 0
+    conn = sqlite3.connect(
+        db.resolve().as_uri() + "?mode=ro",
+        uri=True,
+        timeout=15,
+    )
+    try:
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+            (table,),
+        ).fetchone()
+        if exists is None:
+            return 0
+        return int(conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0] or 0)
+    finally:
+        conn.close()
+
+
+def teacher_consent_record_counts(slug: str) -> dict[str, int]:
+    """只统计老师库中的监护人同意记录数量，不读取学生内容。"""
+    db = _teacher_db(slug)
+    return {
+        "guardian": _db_table_count(db, "guardian_consent_records"),
+    }
+
+
+def organization_consent_record_counts(org_id: int) -> dict[str, int]:
+    totals = {"guardian": 0}
+    for member in platform_store.list_org_users(int(org_id)):
+        slug = (
+            cloud_store.normalize_slug(member.get("slug"))
+            or cloud_store.DEFAULT_SLUG
+        )
+        counts = teacher_consent_record_counts(slug)
+        totals["guardian"] += int(counts["guardian"])
+    return totals
+
+
 def delete_organization(
     org_id: int,
     confirmation_name: str,
     *,
     actor_slug: str,
+    consent_records_confirmed: bool = False,
 ) -> tuple[bool, str]:
     """平台管理员彻底删除一个机构及其全部老师和云端数据。"""
     if platform_store.is_impersonating():
@@ -636,6 +700,14 @@ def delete_organization(
     if protected:
         return False, "这个机构里有平台管理员或受保护教学账号，不能删除"
 
+    consent_counts = organization_consent_record_counts(int(org_id))
+    if consent_counts["guardian"] and not consent_records_confirmed:
+        return False, (
+            "这个机构还有监护人同意记录："
+            f"{consent_counts['guardian']} 条。"
+            "为防止误删，已停止。请先导出，并明确确认这些记录会随机构删除。"
+        )
+
     deleted_objects = 0
     for slug in slugs:
         try:
@@ -655,7 +727,10 @@ def delete_organization(
         "delete_organization",
         target_type="organization",
         target_id=int(org_id),
-        detail=f"teachers={len(slugs)};objects={deleted_objects}",
+        detail=(
+            f"teachers={len(slugs)};objects={deleted_objects};"
+            f"guardian_consents={consent_counts['guardian']}"
+        ),
         org_id=int(org_id),
     )
     return True, ""
@@ -1262,7 +1337,14 @@ def teacher_students(slug: str) -> pd.DataFrame:
 
 
 def create_student_account(
-    slug: str, student_id: int, username: str, password: str
+    slug: str,
+    student_id: int,
+    username: str,
+    password: str,
+    *,
+    guardian_consent: bool = False,
+    actor_user_id: int | None = None,
+    actor_username: str = "",
 ) -> tuple[bool, str]:
     """替某位老师给他的学生开账号（老师自己不能开账号）。"""
     name = str(username or "").strip()
@@ -1277,6 +1359,9 @@ def create_student_account(
         db, name, str(password or "").strip(), um.ROLE_STUDENT,
         student_id=int(student_id), must_change_password=True, note="由总后台开通",
         org_id=platform_store.org_id_for_slug(slug),
+        guardian_consent=guardian_consent,
+        actor_user_id=actor_user_id,
+        actor_username=actor_username,
     )
     if not ok:
         return False, err
@@ -1630,15 +1715,28 @@ def page_admin() -> None:
                 if protected:
                     st.caption("包含平台管理员或受保护教学账号，禁止删除。")
                     continue
+                consent_counts = organization_consent_record_counts(org_id)
                 st.caption(
                     f"将删除 {len(members)} 位老师及其全部业务数据。"
                     f"请输入机构名称「{org.get('name') or ''}」确认。"
                 )
+                if consent_counts["guardian"]:
+                    st.warning(
+                        "这个机构还有监护人同意记录："
+                        f"{consent_counts['guardian']} 条。"
+                        "默认不会删除；如需继续，必须明确勾选下方确认。"
+                    )
                 with st.form(f"delete_org_{org_id}"):
                     confirm_name = st.text_input(
                         "输入机构名称",
                         key=f"delete_org_name_{org_id}",
                     )
+                    consent_confirmed = False
+                    if consent_counts["guardian"]:
+                        consent_confirmed = st.checkbox(
+                            "我已知悉：删除机构会永久删除上述监护人同意记录",
+                            key=f"delete_org_consents_{org_id}",
+                        )
                     confirmed = st.form_submit_button(
                         "永久删除这个机构",
                         type="primary",
@@ -1648,6 +1746,7 @@ def page_admin() -> None:
                         org_id,
                         confirm_name,
                         actor_slug=my_slug,
+                        consent_records_confirmed=consent_confirmed,
                     )
                     if ok:
                         st.session_state["admin_org_deleted"] = str(

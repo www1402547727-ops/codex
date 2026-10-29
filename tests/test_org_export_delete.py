@@ -58,6 +58,46 @@ def _make_db(path: Path, marker: str) -> None:
         conn.close()
 
 
+def _add_consent_rows(path: Path, marker: str) -> None:
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS guardian_consent_records(
+                id INTEGER PRIMARY KEY,
+                student_user_id INTEGER,
+                student_username TEXT,
+                student_id INTEGER,
+                teacher_user_id INTEGER,
+                teacher_username TEXT,
+                org_id INTEGER,
+                version TEXT,
+                accepted_at TEXT
+            );
+            """
+        )
+        conn.execute(
+            """INSERT INTO guardian_consent_records(
+                   student_user_id, student_username, student_id,
+                   teacher_user_id, teacher_username, org_id,
+                   version, accepted_at
+               ) VALUES(?,?,?,?,?,?,?,?)""",
+            (
+                2,
+                f"student_{marker}",
+                1,
+                1,
+                f"teacher_{marker}",
+                1,
+                "v1",
+                "2026-10-29T10:01:00",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 class OrganizationExportDeleteTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -109,6 +149,7 @@ class OrganizationExportDeleteTests(unittest.TestCase):
         _make_db(dbs["org_a_admin"], "甲管理员")
         _make_db(dbs["org_a_teacher"], "甲老师")
         _make_db(dbs["org_b_admin"], "乙机构")
+        _add_consent_rows(dbs["org_a_admin"], "甲管理员")
 
         data = admin_console.export_organization_zip(
             org_a,
@@ -129,9 +170,12 @@ class OrganizationExportDeleteTests(unittest.TestCase):
             users_csv = archive.read("老师/org_a_admin/users.csv").decode(
                 "utf-8-sig"
             )
+            guardian_csv = archive.read("监护人同意记录.csv").decode("utf-8-sig")
 
         self.assertIn("机构信息.csv", names)
         self.assertIn("老师清单.csv", names)
+        self.assertNotIn("说明同意记录.csv", names)
+        self.assertIn("监护人同意记录.csv", names)
         self.assertIn("老师/org_a_admin/students.csv", names)
         self.assertIn("老师/org_a_admin/plans.csv", names)
         self.assertIn("老师/org_a_teacher/students.csv", names)
@@ -141,6 +185,7 @@ class OrganizationExportDeleteTests(unittest.TestCase):
         self.assertIn("待上课", plans_csv)
         self.assertIn("[已隐藏]", users_csv)
         self.assertNotIn("fake-hash", users_csv)
+        self.assertIn("student_甲管理员", guardian_csv)
         self.assertFalse(any("org_b_admin" in name for name in names))
         self.assertFalse(any("personal_teacher" in name for name in names))
         actions = {
@@ -245,6 +290,67 @@ class OrganizationExportDeleteTests(unittest.TestCase):
         ]
         self.assertIn("delete_organization", actions)
         self.assertNotEqual(admin_org, org_id)
+
+    def test_delete_org_blocks_consent_records_without_explicit_confirmation(self):
+        admin_org = self._org_with_members("平台总部同意保护", ["platform_admin"])
+        teacher_registry.update_teacher("platform_admin", is_admin=True)
+        org_id = self._org_with_members(
+            "待删除同意记录机构",
+            ["consent_teacher"],
+        )
+        db = (
+            cloud_store.get_data_dir(
+                teacher_registry.base_dir(),
+                "consent_teacher",
+            )
+            / "scores.db"
+        )
+        _make_db(db, "同意记录")
+        _add_consent_rows(db, "同意记录")
+        self.assertTrue(
+            platform_store.accept_teacher_notice(
+                "consent_teacher",
+                version="v2",
+                accepted_at="2026-10-29T10:00:00",
+            )
+        )
+
+        with patch.object(
+            cloud_store,
+            "delete_teacher_storage",
+            return_value=0,
+        ) as deleting:
+            ok, err = admin_console.delete_organization(
+                org_id,
+                "待删除同意记录机构",
+                actor_slug="platform_admin",
+            )
+        self.assertFalse(ok)
+        self.assertIn("监护人同意记录：1 条", err)
+        self.assertIsNotNone(platform_store.get_organization(org_id))
+        deleting.assert_not_called()
+
+        with patch.object(
+            cloud_store,
+            "delete_teacher_storage",
+            return_value=0,
+        ):
+            ok, err = admin_console.delete_organization(
+                org_id,
+                "待删除同意记录机构",
+                actor_slug="platform_admin",
+                consent_records_confirmed=True,
+            )
+        self.assertTrue(ok, err)
+        self.assertIsNone(platform_store.get_organization(org_id))
+        self.assertIsNotNone(platform_store.get_organization(admin_org))
+        self.assertEqual(
+            [
+                row["username"]
+                for row in platform_store.list_teacher_notice_consents()
+            ],
+            ["consent_teacher"],
+        )
 
     def test_cloud_cleanup_uses_exact_files_and_never_platform_backup(self):
         config = {

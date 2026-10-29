@@ -2014,8 +2014,12 @@ if int(user.get("must_change_password") or 0) == 1:
     um.page_account(force_change=True)
     st.stop()
 
-if um.notice_required(user):
+if not um.server_side_notice_allows_page(user):
     um.page_notice(require_acceptance=True)
+    st.stop()
+
+if st.session_state.pop("view_notice", False):
+    um.page_notice(show_back=True)
     st.stop()
 
 if user["role"] == um.ROLE_TEACHER:
@@ -2038,13 +2042,11 @@ if user["role"] == um.ROLE_TEACHER:
             "学生": page_students,
             "授课统计": cm.page_stats,
             "考试成绩": page_exams,
-            "体验版说明": um.page_notice,
         }
     elif IS_ADMIN:
         PAGES = {
             "平台概览": admin_console.page_platform_overview,
             "账号管理": admin_console.page_admin,
-            "体验版说明": um.page_notice,
             "账号": um.page_account,
         }
     else:
@@ -2064,7 +2066,6 @@ if user["role"] == um.ROLE_TEACHER:
             PAGES["账号管理"] = lambda: um.page_user_admin(allow_delete=False)
         if IS_ORG_ADMIN:
             PAGES["机构管理"] = admin_console.page_org_admin
-        PAGES["体验版说明"] = um.page_notice
         PAGES["账号"] = um.page_account
 else:
     PAGES = {

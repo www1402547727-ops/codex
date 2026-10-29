@@ -215,7 +215,10 @@ class PlatformStoreTests(unittest.TestCase):
             "student_test",
             "student-password",
             um.ROLE_STUDENT,
+            student_id=1,
             org_id=org_id,
+            guardian_consent=True,
+            actor_username="teacher_test",
         )
         self.assertTrue(ok, err)
         conn = sqlite3.connect(db)

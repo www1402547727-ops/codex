@@ -374,14 +374,15 @@ def _seed_demo_data(db: Path, org_id: int, student_password: str) -> None:
                 "SELECT id FROM users WHERE role='teacher' LIMIT 1"
             ).fetchone()[0]
         )
-        conn.execute(
-            """INSERT OR IGNORE INTO consent_records(user_id, version, accepted_at)
-               VALUES(?,?,?)""",
-            (teacher_id, um.NOTICE_VERSION, now),
-        )
         conn.commit()
     finally:
         conn.close()
+
+    platform_store.accept_teacher_notice(
+        DEMO_TEACHER_USERNAME,
+        version=um.NOTICE_VERSION,
+        accepted_at=now,
+    )
 
     ok, err = um.create_account_in(
         db,
@@ -392,6 +393,9 @@ def _seed_demo_data(db: Path, org_id: int, student_password: str) -> None:
         must_change_password=False,
         note="演示学生账号",
         org_id=int(org_id),
+        guardian_consent=True,
+        actor_user_id=teacher_id,
+        actor_username=DEMO_TEACHER_USERNAME,
     )
     if not ok:
         raise RuntimeError(err)
@@ -419,6 +423,8 @@ def reset_demo(actor_slug: str) -> tuple[bool, str, dict | None]:
             int(existing["id"]),
             DEMO_ORG_NAME,
             actor_slug=actor_slug,
+            # 演示机构本来就是虚构数据，重置动作本身已由平台管理员明确触发。
+            consent_records_confirmed=True,
         )
         if not ok:
             return False, err, None
