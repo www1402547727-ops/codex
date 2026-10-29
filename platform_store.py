@@ -35,6 +35,7 @@ ROLE_LABELS = {
 ORG_KINDS = ("机构", "个人")
 ORG_STATUSES = ("体验", "正式", "停用")
 DEFAULT_ORG_NAME = "默认机构"
+PLATFORM_CONTACT_KEY = "notice_contact"
 
 _lock = threading.RLock()
 _base_dir: Path | None = None
@@ -151,6 +152,11 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_teacher_notice_consents_user
             ON teacher_notice_consents(username, accepted_at);
+        CREATE TABLE IF NOT EXISTS platform_settings(
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
         CREATE TABLE IF NOT EXISTS system_errors(
             id INTEGER PRIMARY KEY,
             at TEXT NOT NULL,
@@ -622,6 +628,59 @@ def list_teacher_notice_consents() -> list[dict]:
         return [dict(row) for row in rows]
     finally:
         conn.close()
+
+
+def get_platform_setting(name: str, default: str = "") -> str:
+    """读取平台级设置；平台库不存在时返回默认值。"""
+    key = str(name or "").strip()
+    if not key:
+        return str(default or "")
+    path = platform_db_path()
+    if not path.is_file():
+        return str(default or "")
+    conn = _connect(path)
+    try:
+        _init_schema(conn)
+        row = conn.execute(
+            "SELECT value FROM platform_settings WHERE key=? LIMIT 1",
+            (key,),
+        ).fetchone()
+        return str(row["value"] or "") if row is not None else str(default or "")
+    finally:
+        conn.close()
+
+
+def set_platform_setting(name: str, value: str) -> None:
+    """写入平台级设置并同步平台库。"""
+    key = str(name or "").strip()
+    if not key:
+        raise ValueError("平台设置名不能为空")
+    with _lock:
+        conn = _connect()
+        try:
+            _init_schema(conn)
+            conn.execute(
+                """INSERT INTO platform_settings(key, value, updated_at)
+                   VALUES(?,?,?)
+                   ON CONFLICT(key) DO UPDATE SET
+                       value=excluded.value,
+                       updated_at=excluded.updated_at""",
+                (key, str(value or "").strip(), _now()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        _save()
+
+
+def get_contact_info() -> str:
+    """老师端体验版说明中显示的平台联系方式。"""
+    return get_platform_setting(PLATFORM_CONTACT_KEY, "").strip()
+
+
+def set_contact_info(value: str) -> None:
+    """设置老师端体验版说明中的联系方式，不改变说明版本号。"""
+    set_platform_setting(PLATFORM_CONTACT_KEY, value)
 
 
 def delete_organization_record(org_id: int) -> bool:

@@ -31,13 +31,13 @@ LOGIN_LOCK_SECONDS = 10 * 60
 LOGIN_MAX_FAILURES = 5
 PASSWORD_ITERATIONS = 310_000
 PASSWORD_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+PLATFORM_NAME = "智学教务平台"
 NOTICE_VERSION = "v2"
-NOTICE_DATE = "2026-10-29"
 GUARDIAN_CONSENT_VERSION = "v1"
 GUARDIAN_CONSENT_DATE = "2026-10-29"
 
-NOTICE_MARKDOWN = """
-### 教务工作台 体验版说明
+NOTICE_MARKDOWN_TEMPLATE = """
+### __PLATFORM_NAME__ 体验版说明
 
 #### 1. 这是什么
 教务工作台是供校外教学机构和老师管理课程、学生、成绩和课时的在线工具。目前是体验版，功能还在完善，可能出现故障、短时间无法访问或功能调整。
@@ -66,8 +66,23 @@ NOTICE_MARKDOWN = """
 如发生可能影响您数据的安全事件，我们会及时通知您。
 
 #### 9. 联系我们
-[平台方名称] · [微信/电话]
+__PLATFORM_NAME__ · __CONTACT_INFO__
 """
+
+
+def notice_markdown(contact_info: str | None = None) -> str:
+    """生成实时说明正文；联系方式变化不会改变说明版本号。"""
+    contact = (
+        str(contact_info).strip()
+        if contact_info is not None
+        else platform_store.get_contact_info().strip()
+    )
+    if not contact:
+        contact = "联系方式暂未设置"
+    return (
+        NOTICE_MARKDOWN_TEMPLATE.replace("__PLATFORM_NAME__", PLATFORM_NAME)
+        .replace("__CONTACT_INFO__", contact)
+    )
 
 
 def configure(db_path: str | Path) -> None:
@@ -824,8 +839,8 @@ def page_notice(
         st.stop()
 
     st.title("体验版说明")
-    st.markdown(NOTICE_MARKDOWN)
-    st.caption(f"版本 {NOTICE_VERSION} · {NOTICE_DATE}")
+    st.markdown(notice_markdown())
+    st.caption(f"版本 {NOTICE_VERSION}")
 
     if show_back and st.button("返回账号", use_container_width=True):
         st.session_state.pop("view_notice", None)

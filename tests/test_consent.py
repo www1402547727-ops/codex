@@ -257,6 +257,36 @@ class ConsentTests(unittest.TestCase):
             self.assertTrue(um.is_platform_admin_account(self.user))
             self.assertFalse(um.notice_required(self.user, db_path=self.db))
 
+    def test_contact_is_live_in_platform_notice_without_version_change(self):
+        self.assertEqual(platform_store.get_contact_info(), "")
+        platform_store.set_contact_info("微信：zhixue-test")
+
+        conn = sqlite3.connect(platform_store.platform_db_path())
+        try:
+            row = conn.execute(
+                "SELECT key, value FROM platform_settings WHERE key=?",
+                (platform_store.PLATFORM_CONTACT_KEY,),
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row, (platform_store.PLATFORM_CONTACT_KEY, "微信：zhixue-test"))
+
+        version_before = um.NOTICE_VERSION
+        notice = um.notice_markdown()
+        self.assertIn("智学教务平台", notice)
+        self.assertIn("微信：zhixue-test", notice)
+        self.assertNotIn("联系方式暂未设置", notice)
+        self.assertNotIn("生效日期", notice)
+
+        platform_store.set_contact_info("电话：13800000000")
+        self.assertEqual(um.NOTICE_VERSION, version_before)
+        updated_notice = um.notice_markdown()
+        self.assertIn("电话：13800000000", updated_notice)
+        self.assertNotIn("微信：zhixue-test", updated_notice)
+
+        platform_store.set_contact_info("")
+        self.assertIn("联系方式暂未设置", um.notice_markdown())
+
     def test_student_account_creation_rejects_without_guardian_consent_backend(self):
         conn = sqlite3.connect(self.db)
         try:

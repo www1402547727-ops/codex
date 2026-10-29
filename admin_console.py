@@ -1386,6 +1386,31 @@ def page_platform_overview() -> None:
         "这里只显示机构、账号数量和存储情况，不显示学生姓名、成绩或试卷内容。"
     )
 
+    contact_info = platform_store.get_contact_info()
+    if not contact_info:
+        st.error(
+            "老师端联系方式暂未设置。请在本页设置联系方式，"
+            "否则老师查看体验版说明时只会看到“联系方式暂未设置”。"
+        )
+    else:
+        st.caption(f"老师端联系方式：{contact_info}")
+
+    with st.expander("平台说明设置", expanded=not bool(contact_info)):
+        with st.form("platform_notice_contact_form"):
+            new_contact_info = st.text_input(
+                "老师端联系方式",
+                value=contact_info,
+                placeholder="例如：微信 zhixue2026 / 电话 13800000000",
+                help="修改后会立即显示在老师端体验版说明中，不会改变说明版本号。",
+            )
+            saved = st.form_submit_button("保存联系方式", type="primary")
+        if saved:
+            platform_store.set_contact_info(new_contact_info)
+            st.session_state["platform_contact_saved"] = True
+            st.rerun()
+    if st.session_state.pop("platform_contact_saved", False):
+        st.success("老师端联系方式已更新。")
+
     rows = build_platform_overview()
     if not rows:
         st.info("还没有机构记录。")
