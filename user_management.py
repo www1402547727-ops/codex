@@ -106,6 +106,14 @@ def _connect(db_path: str | Path | None = None) -> sqlite3.Connection:
     return platform_store.guard_connection(conn)
 
 
+def _has_table(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+        (str(table),),
+    ).fetchone()
+    return row is not None
+
+
 def _clean(params):
     return [p.item() if hasattr(p, "item") else p for p in params]
 
@@ -271,6 +279,7 @@ def init_user_db(
     default_teacher_password: str | None = None,
     object_path: str | None = None,
     org_id: int | None = None,
+    save_cloud: bool = True,
 ) -> None:
     """建账号相关表并（首次）创建老师账号。
 
@@ -332,35 +341,44 @@ def init_user_db(
             "CREATE INDEX IF NOT EXISTS idx_users_org ON users(org_id, role)"
         )
 
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(one_to_one_students)")}
-        if "student_id" not in columns:
-            conn.execute("ALTER TABLE one_to_one_students ADD COLUMN student_id INTEGER")
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_one_to_one_student_link ON one_to_one_students(student_id)"
-        )
-
-        # Link existing one-to-one students to the general student table.
-        rows = conn.execute(
-            """SELECT id, name, grade FROM one_to_one_students
-               WHERE student_id IS NULL ORDER BY id"""
-        ).fetchall()
-        for row in rows:
-            student = conn.execute(
-                "SELECT id FROM students WHERE name=? ORDER BY id LIMIT 1",
-                (row["name"],),
-            ).fetchone()
-            if student:
-                student_id = int(student["id"])
-            else:
-                cur = conn.execute(
-                    "INSERT INTO students(name, grade, status) VALUES(?,?,?)",
-                    (row["name"], row["grade"] or "", "在读"),
+        # 平台管理员使用独立的轻量账号库，不需要课程/学生业务表。
+        # 只有业务库确实存在这两张表时，才执行一对一学生关联迁移。
+        if _has_table(conn, "one_to_one_students") and _has_table(conn, "students"):
+            columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(one_to_one_students)")
+            }
+            if "student_id" not in columns:
+                conn.execute(
+                    "ALTER TABLE one_to_one_students ADD COLUMN student_id INTEGER"
                 )
-                student_id = int(cur.lastrowid)
             conn.execute(
-                "UPDATE one_to_one_students SET student_id=? WHERE id=?",
-                (student_id, int(row["id"])),
+                "CREATE INDEX IF NOT EXISTS idx_one_to_one_student_link "
+                "ON one_to_one_students(student_id)"
             )
+
+            # Link existing one-to-one students to the general student table.
+            rows = conn.execute(
+                """SELECT id, name, grade FROM one_to_one_students
+                   WHERE student_id IS NULL ORDER BY id"""
+            ).fetchall()
+            for row in rows:
+                student = conn.execute(
+                    "SELECT id FROM students WHERE name=? ORDER BY id LIMIT 1",
+                    (row["name"],),
+                ).fetchone()
+                if student:
+                    student_id = int(student["id"])
+                else:
+                    cur = conn.execute(
+                        "INSERT INTO students(name, grade, status) VALUES(?,?,?)",
+                        (row["name"], row["grade"] or "", "在读"),
+                    )
+                    student_id = int(cur.lastrowid)
+                conn.execute(
+                    "UPDATE one_to_one_students SET student_id=? WHERE id=?",
+                    (student_id, int(row["id"])),
+                )
 
         teacher_count = int(
             conn.execute("SELECT COUNT(*) FROM users WHERE role=?", (ROLE_TEACHER,)).fetchone()[0]
@@ -390,7 +408,8 @@ def init_user_db(
                 (int(org_id),),
             )
         conn.commit()
-        cloud_store.save_database(target, object_path)
+        if save_cloud:
+            cloud_store.save_database(target, object_path)
     finally:
         conn.close()
 
@@ -526,22 +545,37 @@ def _clear_login_failures(username: str) -> None:
 
 
 def _get_user_by_username(username: str):
-    df = query(
-        """SELECT u.*, s.name AS student_name
-           FROM users u LEFT JOIN students s ON s.id=u.student_id
-           WHERE u.username=? LIMIT 1""",
-        (str(username or "").strip(),),
-    )
+    conn = _connect()
+    try:
+        if _has_table(conn, "students"):
+            sql = """SELECT u.*, s.name AS student_name
+                     FROM users u LEFT JOIN students s ON s.id=u.student_id
+                     WHERE u.username=? LIMIT 1"""
+        else:
+            sql = """SELECT u.*, '' AS student_name
+                     FROM users u WHERE u.username=? LIMIT 1"""
+        df = pd.read_sql_query(
+            sql,
+            conn,
+            params=(str(username or "").strip(),),
+        )
+    finally:
+        conn.close()
     return None if df.empty else df.iloc[0]
 
 
 def _get_user(user_id: int):
     conn = _connect(_auth_db_path())
     try:
+        if _has_table(conn, "students"):
+            sql = """SELECT u.*, s.name AS student_name
+                     FROM users u LEFT JOIN students s ON s.id=u.student_id
+                     WHERE u.id=? LIMIT 1"""
+        else:
+            sql = """SELECT u.*, '' AS student_name
+                     FROM users u WHERE u.id=? LIMIT 1"""
         df = pd.read_sql_query(
-            """SELECT u.*, s.name AS student_name
-               FROM users u LEFT JOIN students s ON s.id=u.student_id
-               WHERE u.id=? LIMIT 1""",
+            sql,
             conn,
             params=(int(user_id),),
         )

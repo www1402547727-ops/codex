@@ -176,6 +176,28 @@ class OrganizationExportDeleteTests(unittest.TestCase):
         self.assertIn("名称", err)
         self.assertIsNotNone(platform_store.get_organization(normal_org))
 
+    def test_delete_protects_former_admin_teacher_account(self):
+        protected_org = self._org_with_members(
+            "原教学数据所在机构",
+            ["former_admin", "regular_teacher"],
+        )
+        teacher_registry.update_teacher("former_admin", protected=True)
+        ok, err = teacher_registry.add_teacher(
+            "platform_admin",
+            "平台管理员",
+            "platform_admin",
+            is_admin=True,
+        )
+        self.assertTrue(ok, err)
+        ok, err = admin_console.delete_organization(
+            protected_org,
+            "原教学数据所在机构",
+            actor_slug="platform_admin",
+        )
+        self.assertFalse(ok)
+        self.assertIn("受保护教学账号", err)
+        self.assertIsNotNone(platform_store.get_organization(protected_org))
+
     def test_delete_removes_org_roster_storage_and_writes_audit(self):
         admin_org = self._org_with_members("平台总部", ["platform_admin"])
         teacher_registry.update_teacher("platform_admin", is_admin=True)

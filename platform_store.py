@@ -187,6 +187,9 @@ def ensure_ready(teachers: list[dict] | None = None) -> int:
                 default_org_id = int(row["id"])
 
             for item in teachers or []:
+                # 平台管理员不是机构老师，不能自动登记进默认机构。
+                if bool(item.get("is_admin")):
+                    continue
                 slug = cloud_store.normalize_slug(item.get("slug")) or cloud_store.DEFAULT_SLUG
                 if not slug:
                     continue

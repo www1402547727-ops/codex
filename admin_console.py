@@ -602,9 +602,10 @@ def delete_organization(
         slug
         for slug in slugs
         if bool((teacher_registry.teacher_entry(slug) or {}).get("is_admin"))
+        or bool((teacher_registry.teacher_entry(slug) or {}).get("protected"))
     ]
     if protected:
-        return False, "这个机构里有平台管理员账号，不能删除"
+        return False, "这个机构里有平台管理员或受保护教学账号，不能删除"
 
     deleted_objects = 0
     for slug in slugs:
@@ -1572,7 +1573,7 @@ def page_admin() -> None:
         admin_slugs = {
             cloud_store.normalize_slug(item.get("slug")) or cloud_store.DEFAULT_SLUG
             for item in teacher_registry.list_teachers()
-            if bool(item.get("is_admin"))
+            if bool(item.get("is_admin")) or bool(item.get("protected"))
         }
         for org in organizations:
             org_id = int(org["id"])
@@ -1586,7 +1587,7 @@ def page_admin() -> None:
             with st.container(border=True):
                 st.markdown(f"**{org.get('name') or '未命名机构'}**")
                 if protected:
-                    st.caption("包含平台管理员账号，禁止删除。")
+                    st.caption("包含平台管理员或受保护教学账号，禁止删除。")
                     continue
                 st.caption(
                     f"将删除 {len(members)} 位老师及其全部业务数据。"
@@ -1620,7 +1621,12 @@ def page_admin() -> None:
 
     st.divider()
 
-    entries = teacher_registry.list_teachers()
+    # 平台管理员是独立账号，不参与老师数量、学生汇总和老师管理列表。
+    entries = [
+        entry
+        for entry in teacher_registry.list_teachers()
+        if not bool(entry.get("is_admin"))
+    ]
     total_students = sum(int((e.get("stats") or {}).get("students") or 0) for e in entries)
     total_lessons = sum(int((e.get("stats") or {}).get("lessons_month") or 0) for e in entries)
     total_scores = sum(int((e.get("stats") or {}).get("scores") or 0) for e in entries)
