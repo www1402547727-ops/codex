@@ -680,6 +680,45 @@ class PlatformStoreTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 admin_console._require_admin("平台概览")
 
+    def test_only_platform_admin_can_write_notice_contact(self):
+        platform_store.ensure_ready([])
+        self.assertTrue(
+            teacher_registry.add_teacher("plain_contact", "", "plain_contact")[0]
+        )
+        self.assertTrue(
+            teacher_registry.add_teacher(
+                "admin_contact",
+                "",
+                "admin_contact",
+                is_admin=True,
+            )[0]
+        )
+
+        ok, error = admin_console.set_platform_contact(
+            "普通老师不能写",
+            actor_user={"role": um.ROLE_TEACHER},
+            actor_slug="plain_contact",
+        )
+        self.assertFalse(ok)
+        self.assertIn("平台管理员", error)
+
+        ok, error = admin_console.set_platform_contact(
+            "学生不能写",
+            actor_user={"role": um.ROLE_STUDENT},
+            actor_slug="plain_contact",
+        )
+        self.assertFalse(ok)
+        self.assertIn("平台管理员", error)
+        self.assertEqual(platform_store.get_contact_info(), "")
+
+        ok, error = admin_console.set_platform_contact(
+            "微信：platform-test",
+            actor_user={"role": um.ROLE_TEACHER},
+            actor_slug="admin_contact",
+        )
+        self.assertTrue(ok, error)
+        self.assertEqual(platform_store.get_contact_info(), "微信：platform-test")
+
     def test_system_errors_are_readable_without_student_content(self):
         platform_store.ensure_ready([])
         platform_store.record_system_error(

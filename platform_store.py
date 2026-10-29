@@ -36,6 +36,7 @@ ORG_KINDS = ("机构", "个人")
 ORG_STATUSES = ("体验", "正式", "停用")
 DEFAULT_ORG_NAME = "默认机构"
 PLATFORM_CONTACT_KEY = "notice_contact"
+CONTACT_MAX_LENGTH = 200
 
 _lock = threading.RLock()
 _base_dir: Path | None = None
@@ -680,7 +681,10 @@ def get_contact_info() -> str:
 
 def set_contact_info(value: str) -> None:
     """设置老师端体验版说明中的联系方式，不改变说明版本号。"""
-    set_platform_setting(PLATFORM_CONTACT_KEY, value)
+    clean = str(value or "").strip()
+    if len(clean) > CONTACT_MAX_LENGTH:
+        raise ValueError(f"联系方式不能超过 {CONTACT_MAX_LENGTH} 个字符")
+    set_platform_setting(PLATFORM_CONTACT_KEY, clean)
 
 
 def delete_organization_record(org_id: int) -> bool:

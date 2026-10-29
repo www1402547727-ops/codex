@@ -287,6 +287,20 @@ class ConsentTests(unittest.TestCase):
         platform_store.set_contact_info("")
         self.assertIn("联系方式暂未设置", um.notice_markdown())
 
+    def test_notice_contact_escapes_markup_and_limits_length(self):
+        markup = "<b>**危险**</b>"
+        safe = um.safe_contact_text(markup)
+        self.assertNotIn("<b>", safe)
+        self.assertIn("&lt;b&gt;", safe)
+        self.assertIn("\\*\\*危险\\*\\*", safe)
+        self.assertNotIn("<b>", um.notice_markdown(markup))
+
+        safe_long = um.safe_contact_text("x" * 250)
+        self.assertEqual(safe_long.count("x"), platform_store.CONTACT_MAX_LENGTH)
+
+        with self.assertRaises(ValueError):
+            platform_store.set_contact_info("x" * (platform_store.CONTACT_MAX_LENGTH + 1))
+
     def test_student_account_creation_rejects_without_guardian_consent_backend(self):
         conn = sqlite3.connect(self.db)
         try:

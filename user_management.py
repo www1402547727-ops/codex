@@ -81,8 +81,18 @@ def notice_markdown(contact_info: str | None = None) -> str:
         contact = "联系方式暂未设置"
     return (
         NOTICE_MARKDOWN_TEMPLATE.replace("__PLATFORM_NAME__", PLATFORM_NAME)
-        .replace("__CONTACT_INFO__", contact)
+        .replace("__CONTACT_INFO__", safe_contact_text(contact))
     )
+
+
+def safe_contact_text(value: str) -> str:
+    """把联系方式限制为单行纯文本，并转义 Markdown/HTML 展示字符。"""
+    text = str(value or "").replace("\r", " ").replace("\n", " ").strip()
+    text = text[: platform_store.CONTACT_MAX_LENGTH]
+    text = html.escape(text, quote=False)
+    for char in ("\\", "`", "*", "_", "{", "}", "[", "]", "|"):
+        text = text.replace(char, "\\" + char)
+    return text
 
 
 def configure(db_path: str | Path) -> None:

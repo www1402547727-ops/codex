@@ -52,6 +52,27 @@ def _require_admin(page_label: str = "平台管理") -> str:
     return slug
 
 
+def set_platform_contact(
+    value: str,
+    *,
+    actor_user: dict | None = None,
+    actor_slug: str | None = None,
+) -> tuple[bool, str]:
+    """平台说明联系方式只能由平台管理员写入。"""
+    user = actor_user if actor_user is not None else um.current_user()
+    if not user or user.get("role") != um.ROLE_TEACHER:
+        return False, "只有平台管理员可以修改老师端联系方式"
+    slug = actor_slug if actor_slug is not None else cloud_store.current_slug()
+    entry = teacher_registry.teacher_entry(slug)
+    if not entry or not bool(entry.get("is_admin")):
+        return False, "只有平台管理员可以修改老师端联系方式"
+    try:
+        platform_store.set_contact_info(value)
+    except ValueError as exc:
+        return False, str(exc)
+    return True, ""
+
+
 def _teacher_db(slug: str) -> Path:
     """拿到某位老师的本地库路径（云端有的话先拉下来）。"""
     data_dir = cloud_store.get_data_dir(teacher_registry.base_dir(), slug)
@@ -1393,7 +1414,7 @@ def page_platform_overview() -> None:
             "否则老师查看体验版说明时只会看到“联系方式暂未设置”。"
         )
     else:
-        st.caption(f"老师端联系方式：{contact_info}")
+        st.caption(f"老师端联系方式：{um.safe_contact_text(contact_info)}")
 
     with st.expander("平台说明设置", expanded=not bool(contact_info)):
         with st.form("platform_notice_contact_form"):
@@ -1405,9 +1426,16 @@ def page_platform_overview() -> None:
             )
             saved = st.form_submit_button("保存联系方式", type="primary")
         if saved:
-            platform_store.set_contact_info(new_contact_info)
-            st.session_state["platform_contact_saved"] = True
-            st.rerun()
+            ok, error = set_platform_contact(
+                new_contact_info,
+                actor_user=um.current_user(),
+                actor_slug=cloud_store.current_slug(),
+            )
+            if ok:
+                st.session_state["platform_contact_saved"] = True
+                st.rerun()
+            else:
+                st.error(error)
     if st.session_state.pop("platform_contact_saved", False):
         st.success("老师端联系方式已更新。")
 
