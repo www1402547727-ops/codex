@@ -7,7 +7,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import streamlit as st
 
@@ -15,6 +15,7 @@ import account_split
 import cloud_store
 import platform_store
 import user_management as um
+import tools.split_platform_admin as split_tool
 
 
 def _test_root() -> Path:
@@ -245,6 +246,156 @@ class AccountSplitTests(unittest.TestCase):
         self.assertEqual(old["username"], "teacher")
         self.assertEqual(old["active"], True)
         self.assertIn("纯老师账号", old["note"])
+
+
+class SplitCloudObjectCheckTests(unittest.TestCase):
+    def test_existing_file_is_detected_without_download(self):
+        rows = [
+            {
+                "name": "scores.db",
+                "object_path": "database/aren_platform/scores.db",
+                "is_file": True,
+            }
+        ]
+        with (
+            patch.object(
+                split_tool.cloud_store,
+                "list_storage_objects",
+                return_value=rows,
+            ) as listing,
+            patch.object(split_tool.cloud_store, "download_object") as download,
+        ):
+            self.assertTrue(
+                split_tool._cloud_object_exists(
+                    "database/aren_platform/scores.db"
+                )
+            )
+        listing.assert_called_once_with(
+            "database/aren_platform",
+            page_size=100,
+            max_items=1000,
+        )
+        download.assert_not_called()
+
+    def test_missing_file_and_directory_are_not_treated_as_files(self):
+        rows = [
+            {
+                "name": "scores.db",
+                "object_path": "database/aren_platform/scores.db",
+                "is_file": False,
+            }
+        ]
+        with patch.object(
+            split_tool.cloud_store,
+            "list_storage_objects",
+            return_value=rows,
+        ):
+            self.assertFalse(
+                split_tool._cloud_object_exists(
+                    "database/aren_platform/scores.db"
+                )
+            )
+        with patch.object(
+            split_tool.cloud_store,
+            "list_storage_objects",
+            return_value=[],
+        ):
+            self.assertFalse(
+                split_tool._cloud_object_exists(
+                    "database/aren_platform/scores.db"
+                )
+            )
+
+    def test_list_read_error_stops_the_check(self):
+        with patch.object(
+            split_tool.cloud_store,
+            "list_storage_objects",
+            side_effect=cloud_store.CloudStorageError("network failed"),
+        ):
+            with self.assertRaises(cloud_store.CloudStorageError):
+                split_tool._cloud_object_exists(
+                    "database/aren_platform/scores.db"
+                )
+
+    def test_fresh_download_bypasses_cache(self):
+        response = Mock(ok=True, status_code=200, content=b"fresh")
+        with (
+            patch.object(split_tool.cloud_store, "is_cloud", return_value=True),
+            patch.object(
+                split_tool.cloud_store,
+                "_object_url",
+                return_value="https://example.test/object",
+            ),
+            patch.object(
+                split_tool.cloud_store,
+                "_headers",
+                return_value={"Authorization": "test"},
+            ),
+            patch.object(
+                split_tool.cloud_store.requests,
+                "get",
+                return_value=response,
+            ) as get,
+            patch.object(split_tool.time, "time_ns", return_value=123),
+        ):
+            self.assertEqual(
+                split_tool._download_cloud_object_fresh("database/teachers.json"),
+                b"fresh",
+            )
+        self.assertEqual(
+            get.call_args.args[0],
+            "https://example.test/object?_st=123",
+        )
+        headers = get.call_args.kwargs["headers"]
+        self.assertEqual(headers["Cache-Control"], "no-cache")
+        self.assertEqual(headers["Pragma"], "no-cache")
+
+    def test_fresh_download_treats_404_as_missing(self):
+        response = Mock(ok=False, status_code=404)
+        with (
+            patch.object(split_tool.cloud_store, "is_cloud", return_value=True),
+            patch.object(
+                split_tool.cloud_store,
+                "_object_url",
+                return_value="https://example.test/object",
+            ),
+            patch.object(
+                split_tool.cloud_store,
+                "_headers",
+                return_value={},
+            ),
+            patch.object(
+                split_tool.cloud_store.requests,
+                "get",
+                return_value=response,
+            ),
+        ):
+            self.assertIsNone(
+                split_tool._download_cloud_object_fresh("database/missing.db")
+            )
+
+    def test_fresh_download_read_error_stops(self):
+        response = Mock(ok=False, status_code=500)
+        with (
+            patch.object(split_tool.cloud_store, "is_cloud", return_value=True),
+            patch.object(
+                split_tool.cloud_store,
+                "_object_url",
+                return_value="https://example.test/object",
+            ),
+            patch.object(
+                split_tool.cloud_store,
+                "_headers",
+                return_value={},
+            ),
+            patch.object(
+                split_tool.cloud_store.requests,
+                "get",
+                return_value=response,
+            ),
+        ):
+            with self.assertRaises(cloud_store.CloudStorageError):
+                split_tool._download_cloud_object_fresh("database/teachers.json")
 
 
 if __name__ == "__main__":

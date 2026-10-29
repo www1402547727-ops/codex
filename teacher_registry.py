@@ -28,6 +28,7 @@ ROSTER_FILENAME = "teachers.json"
 # 取值必须和 cloud_store.DEFAULT_SLUG 保持一致（有测试守着）。
 DEFAULT_SLUG = "default"
 DEFAULT_TEACHER_USERNAME = "teacher"
+RESERVED_USERNAMES = frozenset({"admin", "root", "platform", "administrator"})
 
 _lock = threading.RLock()
 _base_dir: Path | None = None
@@ -300,6 +301,8 @@ def session_slug() -> str | None:
 
 def username_owner(username: str) -> str | None:
     """这个登录名当前归哪位老师；没被占用返回 None。"""
+    if _base_dir is None:
+        return None
     name = str(username or "").strip()
     if not name:
         return None
@@ -312,6 +315,35 @@ def username_owner(username: str) -> str | None:
         if str(key).lower() == lowered:
             return cloud_store.normalize_slug(value) or DEFAULT_SLUG
     return None
+
+
+def is_reserved_username(username: str) -> bool:
+    return str(username or "").strip().lower() in RESERVED_USERNAMES
+
+
+def validate_new_username(
+    username: str,
+    *,
+    current_slug: str | None = None,
+    allow_reserved: bool = False,
+) -> tuple[bool, str]:
+    """校验新建或改名时使用的登录名。"""
+    name = str(username or "").strip()
+    if not name:
+        return False, "请填写登录账号"
+    if is_reserved_username(name) and not allow_reserved:
+        return False, f"账号「{name}」是系统保留名称，不能使用"
+    if not name.isascii() or any(ch.isspace() for ch in name):
+        return False, "登录账号请用英文字母或数字，不要有空格"
+    owner = username_owner(name)
+    current = (
+        cloud_store.normalize_slug(current_slug) or DEFAULT_SLUG
+        if current_slug is not None
+        else None
+    )
+    if owner is not None and owner != current:
+        return False, f"账号「{name}」已经被占用了，换一个"
+    return True, ""
 
 
 def note_usernames(slug: str, db_path: str | Path) -> bool:
@@ -372,14 +404,14 @@ def add_teacher(
     slug: str | None = None,
     is_admin: bool = False,
     note: str = "",
+    personal: bool = False,
 ) -> tuple[bool, str]:
     """把一位老师登记进名册（建库由调用方负责）。"""
     name = str(username or "").strip()
-    if not name:
-        return False, "请填写登录账号"
-    if username_owner(name) is not None:
-        return False, f"账号「{name}」已经被占用了，换一个"
     target = cloud_store.normalize_slug(slug) or DEFAULT_SLUG
+    valid, error = validate_new_username(name)
+    if not valid:
+        return False, error
     if teacher_entry(target) is not None:
         return False, "这个数据标识已经被占用了"
     with _lock:
@@ -391,6 +423,7 @@ def add_teacher(
                 "slug": target,
                 "active": True,
                 "is_admin": bool(is_admin),
+                "personal": bool(personal),
                 "created_at": _now(),
                 "note": str(note or ""),
             }
@@ -400,8 +433,51 @@ def add_teacher(
     return True, ""
 
 
+def rename_teacher(
+    slug: str,
+    new_username: str,
+    *,
+    allow_reserved: bool = False,
+    **changes,
+) -> None:
+    """改名册里的登录名，并同步用户名映射。"""
+    target = cloud_store.normalize_slug(slug) or DEFAULT_SLUG
+    name = str(new_username or "").strip()
+    valid, error = validate_new_username(
+        name,
+        current_slug=target,
+        allow_reserved=allow_reserved,
+    )
+    if not valid:
+        raise ValueError(error)
+    with _lock:
+        roster = load()
+        entry = next(
+            (
+                item
+                for item in roster.get("teachers", [])
+                if (cloud_store.normalize_slug(item.get("slug")) or DEFAULT_SLUG)
+                == target
+            ),
+            None,
+        )
+        if entry is None:
+            raise ValueError("找不到这位老师")
+        old = str(entry.get("username") or "").strip()
+        if old.lower() != name.lower():
+            mapping = roster.setdefault("usernames", {})
+            for key in [key for key in mapping if key.lower() == old.lower()]:
+                mapping.pop(key, None)
+            mapping[name] = target
+        entry["username"] = name
+        entry.update(changes)
+        save(roster, strict=True)
+
+
 def update_teacher(slug: str, **changes) -> None:
     target = cloud_store.normalize_slug(slug) or DEFAULT_SLUG
+    if "username" in changes:
+        raise ValueError("修改登录账号请使用 rename_teacher()")
     with _lock:
         roster = load()
         for item in roster.get("teachers", []):

@@ -406,6 +406,38 @@ class PlatformStoreTests(unittest.TestCase):
         self.assertTrue(any(row["detail"] == "invalid_credentials" for row in rows))
         self.assertNotIn("wrong-password", str(rows))
 
+    def test_platform_admin_failed_login_is_audited(self):
+        db = self.base / "platform_login_test" / "scores.db"
+        db.parent.mkdir(parents=True, exist_ok=True)
+        _init_fake_schema(db)
+        um.init_user_db(
+            db,
+            default_teacher_password="platform-password",
+            object_path=cloud_store.db_object_path("platform_login_test"),
+            org_id=None,
+        )
+        conn = sqlite3.connect(db)
+        try:
+            conn.execute(
+                "UPDATE users SET username=? WHERE role='teacher'",
+                ("aren_platform",),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        um.configure(db)
+
+        user, error = um.authenticate("aren_platform", "wrong-password")
+        self.assertIsNone(user)
+        self.assertTrue(error)
+        rows = platform_store.list_audit(actor_role="anonymous")
+        failed = [row for row in rows if row["action"] == "login_failed"]
+        self.assertTrue(failed)
+        self.assertEqual(failed[0]["target_id"], "aren_platform")
+        self.assertEqual(failed[0]["detail"], "invalid_credentials")
+        self.assertIsNone(failed[0]["org_id"])
+        self.assertNotIn("wrong-password", str(rows))
+
     def test_org_admin_cannot_disable_another_org_teacher(self):
         org_a, _ = platform_store.create_organization("测试机构丙")
         org_b, _ = platform_store.create_organization("测试机构丁")
@@ -518,6 +550,54 @@ class PlatformStoreTests(unittest.TestCase):
         self.assertEqual(row["course_count_30d"], 1)
         self.assertIsNone(row["media_count"])
         self.assertTrue(row["media_error"])
+
+    def test_platform_overview_includes_personal_teacher_without_org(self):
+        ok, err = teacher_registry.add_teacher(
+            "personal_teacher",
+            "个人老师",
+            "personal_teacher",
+            personal=True,
+        )
+        self.assertTrue(ok, err)
+        db = self.base / "personal_teacher" / "scores.db"
+        _init_overview_db(
+            db,
+            students=1,
+            plan_dates=["2026-10-28"],
+            exams=1,
+            teacher_last_login="2026-10-28 08:00:00",
+        )
+
+        rows = admin_console.build_platform_overview(
+            db_resolver=lambda _slug: db,
+            media_resolver=lambda _slug: {"count": 0, "bytes": 0},
+            today=date(2026, 10, 28),
+        )
+
+        personal = next(row for row in rows if row["name"] == "个人老师")
+        self.assertEqual(personal["kind"], "个人")
+        self.assertEqual(personal["status"], "未挂机构")
+        self.assertEqual(personal["teacher_count"], 1)
+        self.assertEqual(personal["student_count"], 1)
+        self.assertEqual(personal["course_count_30d"], 1)
+
+    def test_personal_teacher_can_login_without_org(self):
+        db = self.base / "personal_login" / "scores.db"
+        db.parent.mkdir(parents=True, exist_ok=True)
+        _init_fake_schema(db)
+        um.init_user_db(
+            db,
+            default_teacher_password="personal-password",
+            object_path=cloud_store.db_object_path("personal_login"),
+            org_id=None,
+        )
+        um.configure(db)
+
+        user, error = um.authenticate("teacher", "personal-password")
+
+        self.assertIsNotNone(user, error)
+        self.assertEqual(user["username"], "teacher")
+        self.assertTrue(user["org_id"] is None or str(user["org_id"]) == "None")
 
     def test_platform_overview_sql_only_reads_operational_counts(self):
         sql = " ".join(

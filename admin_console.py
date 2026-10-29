@@ -193,18 +193,13 @@ def build_platform_overview(
     各老师自己的库和对应图片目录。返回值不包含学生姓名、成绩或试卷内容。
     """
     organizations = platform_store.list_organizations()
-    if not organizations:
-        return []
     db_resolver = db_resolver or _teacher_db
     media_resolver = media_resolver or _overview_media_stats
     current = today or date.today()
     since = (current - timedelta(days=29)).isoformat()
     today_text = current.isoformat()
 
-    rows: list[dict] = []
-    for org in organizations:
-        org_id = int(org["id"])
-        members = platform_store.list_org_users(org_id)
+    def summarize(members: list[dict]) -> dict:
         total_students = 0
         total_courses = 0
         total_exams = 0
@@ -244,23 +239,57 @@ def build_platform_overview(
             except Exception:
                 media_error = True
 
+        return {
+            "teacher_count": len(members),
+            "student_count": total_students,
+            "course_count_30d": total_courses,
+            "exam_count": total_exams,
+            "last_login": _max_time_text(last_logins),
+            "media_count": None if media_error else total_media,
+            "media_bytes": total_media_bytes,
+            "read_error": read_error,
+            "media_error": media_error,
+            "_db_bytes": total_db_bytes,
+        }
+
+    rows: list[dict] = []
+    assigned_slugs: set[str] = set()
+    for org in organizations:
+        org_id = int(org["id"])
+        members = platform_store.list_org_users(org_id)
+        assigned_slugs.update(
+            cloud_store.normalize_slug(member.get("slug")) or cloud_store.DEFAULT_SLUG
+            for member in members
+        )
+        totals = summarize(members)
         rows.append(
             {
                 "org_id": org_id,
                 "name": str(org.get("name") or ""),
                 "kind": str(org.get("kind") or "机构"),
                 "status": str(org.get("status") or ""),
-                "teacher_count": len(members),
-                "student_count": total_students,
-                "course_count_30d": total_courses,
-                "exam_count": total_exams,
-                "last_login": _max_time_text(last_logins),
-                "media_count": None if media_error else total_media,
-                "media_bytes": total_media_bytes,
                 "created_at": str(org.get("created_at") or ""),
-                "read_error": read_error,
-                "media_error": media_error,
-                "_db_bytes": total_db_bytes,
+                **totals,
+            }
+        )
+
+    personal_members = [
+        {"slug": cloud_store.normalize_slug(item.get("slug")) or cloud_store.DEFAULT_SLUG}
+        for item in teacher_registry.list_teachers()
+        if not bool(item.get("is_admin"))
+        and (cloud_store.normalize_slug(item.get("slug")) or cloud_store.DEFAULT_SLUG)
+        not in assigned_slugs
+    ]
+    if personal_members:
+        totals = summarize(personal_members)
+        rows.append(
+            {
+                "org_id": None,
+                "name": "个人老师",
+                "kind": "个人",
+                "status": "未挂机构",
+                "created_at": "",
+                **totals,
             }
         )
     return rows
@@ -707,25 +736,28 @@ def create_teacher(
     *,
     org_id: int | None = None,
     org_role: str = "teacher",
+    personal: bool = False,
 ) -> tuple[bool, str]:
     """开通一位新老师：建一份空库 + 建账号 + 登记名册。"""
     name = str(username or "").strip()
-    if not name:
-        return False, "请填写登录账号"
-    if not name.isascii() or any(ch.isspace() for ch in name):
-        return False, "登录账号请用英文字母或数字，不要有空格"
-    if teacher_registry.username_owner(name) is not None:
-        return False, f"账号「{name}」已经被占用了，换一个"
+    valid, error = teacher_registry.validate_new_username(name)
+    if not valid:
+        return False, error
     pwd = str(password or "").strip()
     if len(pwd) < 6:
         return False, "初始密码至少 6 位"
     if org_role not in (platform_store.ROLE_TEACHER, platform_store.ROLE_ORG_ADMIN):
         return False, "机构权限不合法"
-    target_org_id = int(org_id) if org_id is not None else platform_store.default_org_id()
-    if target_org_id is None:
-        return False, "找不到可用的机构"
-    if platform_store.get_organization(target_org_id) is None:
-        return False, "机构不存在"
+    if personal and org_role != platform_store.ROLE_TEACHER:
+        return False, "个人老师不能设置机构管理员权限"
+    target_org_id = None if personal else (
+        int(org_id) if org_id is not None else platform_store.default_org_id()
+    )
+    if not personal:
+        if target_org_id is None:
+            return False, "找不到可用的机构"
+        if platform_store.get_organization(target_org_id) is None:
+            return False, "机构不存在"
 
     slug = teacher_registry.unique_slug(name)
     object_path = cloud_store.db_object_path(slug)
@@ -757,21 +789,27 @@ def create_teacher(
     except Exception as exc:
         return False, f"给这位老师建库时出错：{exc}"
 
-    ok, err = teacher_registry.add_teacher(name, display_name, slug)
+    ok, err = teacher_registry.add_teacher(
+        name,
+        display_name,
+        slug,
+        personal=personal,
+    )
     if not ok:
         return False, err
-    member_ok, member_err = platform_store.add_org_user(
-        target_org_id, slug, org_role
-    )
-    if not member_ok:
-        return False, member_err
+    if target_org_id is not None:
+        member_ok, member_err = platform_store.add_org_user(
+            target_org_id, slug, org_role
+        )
+        if not member_ok:
+            return False, member_err
     cloud_store.save_database(db, object_path)
     teacher_registry.note_usernames(slug, db)
     _record_platform_audit(
         "create_teacher_account",
         target_type="teacher_account",
         target_id=slug,
-        detail=f"org_id={target_org_id}",
+        detail=("personal=true" if personal else f"org_id={target_org_id}"),
         org_id=target_org_id,
     )
     return True, ""
@@ -790,13 +828,12 @@ def rename_teacher(
         return False, "找不到这位老师"
     old = str(entry.get("username") or "").strip()
     new = str(new_username or "").strip()
-    if not new:
-        return False, "请填写登录账号"
-    if not new.isascii() or any(ch.isspace() for ch in new):
-        return False, "登录账号请用英文字母或数字，不要有空格"
-    owner = teacher_registry.username_owner(new)
-    if owner is not None and owner != slug:
-        return False, f"账号「{new}」已经被占用了，换一个"
+    valid, error = teacher_registry.validate_new_username(
+        new,
+        current_slug=slug,
+    )
+    if not valid:
+        return False, error
     display = (
         entry.get("display_name")
         if new_display_name is None
@@ -826,7 +863,11 @@ def rename_teacher(
             conn.close()
 
     try:
-        teacher_registry.update_teacher(slug, username=new, display_name=display)
+        teacher_registry.rename_teacher(
+            slug,
+            new,
+            display_name=display,
+        )
     except Exception as exc:
         if changed_db:
             conn = sqlite3.connect(db)
@@ -851,7 +892,12 @@ def rename_teacher(
             conn.commit()
         finally:
             conn.close()
-        teacher_registry.update_teacher(slug, username=old, display_name=entry.get("display_name") or "")
+        teacher_registry.rename_teacher(
+            slug,
+            old,
+            display_name=entry.get("display_name") or "",
+            allow_reserved=True,
+        )
         return False, f"同步到云端失败，已全部退回原账号，请稍后重试：{exc}"
     _record_platform_audit(
         "rename_teacher_account",
@@ -923,12 +969,9 @@ def create_organization_with_admin(
 ) -> tuple[bool, str, int | None]:
     """新建机构，并在同一份新库里创建第一位机构管理员。"""
     name = str(admin_username or "").strip()
-    if not name:
-        return False, "请填写机构管理员登录账号", None
-    if not name.isascii() or any(ch.isspace() for ch in name):
-        return False, "登录账号请用英文字母或数字，不要有空格", None
-    if teacher_registry.username_owner(name) is not None:
-        return False, f"账号「{name}」已经被占用了，换一个", None
+    valid, validation_error = teacher_registry.validate_new_username(name)
+    if not valid:
+        return False, validation_error, None
     org_id, err = platform_store.create_organization(
         org_name,
         kind=kind,
@@ -1223,11 +1266,9 @@ def create_student_account(
 ) -> tuple[bool, str]:
     """替某位老师给他的学生开账号（老师自己不能开账号）。"""
     name = str(username or "").strip()
-    if not name:
-        return False, "请填写账号"
-    owner = teacher_registry.username_owner(name)
-    if owner is not None:
-        return False, f"账号「{name}」已经被占用了，换一个"
+    valid, error = teacher_registry.validate_new_username(name)
+    if not valid:
+        return False, error
     object_path = cloud_store.db_object_path(slug)
     db = _teacher_db(slug)
     if not db.is_file():
@@ -1269,7 +1310,7 @@ def page_platform_overview() -> None:
         total_courses = sum(int(row["course_count_30d"]) for row in rows)
         total_exams = sum(int(row["exam_count"]) for row in rows)
         m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("机构", len(rows))
+        m1.metric("机构/个人", len(rows))
         m2.metric("老师", total_teachers)
         m3.metric("学生", total_students)
         m4.metric("近 30 天课程", total_courses)
@@ -1675,19 +1716,50 @@ def page_admin() -> None:
             display_name = f1.text_input("老师称呼", placeholder="例如：李老师", key="admin_new_display")
             username = f2.text_input("登录账号", placeholder="英文字母或数字，例如 lilaoshi", key="admin_new_username")
             password = f3.text_input("初始密码", placeholder="留空自动生成", key="admin_new_password")
+            f4, f5 = st.columns(2)
+            account_type = f4.selectbox(
+                "账号类型",
+                ["机构", "个人"],
+                key="admin_new_account_type",
+                help="个人老师不挂任何机构；机构老师会加入所选机构。",
+            )
+            selected_org_id = None
+            if account_type == "机构":
+                if organizations:
+                    org_options = {
+                        int(org["id"]): str(org.get("name") or "未命名机构")
+                        for org in organizations
+                    }
+                    selected_org_id = f5.selectbox(
+                        "所属机构",
+                        options=list(org_options),
+                        format_func=lambda org_id: org_options[int(org_id)],
+                        key="admin_new_org_id",
+                    )
+                else:
+                    f5.warning("还没有机构，请先新建机构，或改选「个人」。")
             submitted = st.form_submit_button("开通", type="primary")
         if submitted:
             pwd = str(password or "").strip() or um.generate_password()
-            ok, err = create_teacher(display_name, username, pwd)
-            if ok:
-                st.session_state["admin_new_teacher_done"] = {
-                    "username": str(username).strip(),
-                    "password": pwd,
-                    "display_name": str(display_name or "").strip(),
-                }
-                st.rerun()
+            if account_type == "机构" and selected_org_id is None:
+                st.error("请先创建并选择一个机构")
             else:
-                st.error(err)
+                ok, err = create_teacher(
+                    display_name,
+                    username,
+                    pwd,
+                    org_id=selected_org_id,
+                    personal=account_type == "个人",
+                )
+                if ok:
+                    st.session_state["admin_new_teacher_done"] = {
+                        "username": str(username).strip(),
+                        "password": pwd,
+                        "display_name": str(display_name or "").strip(),
+                    }
+                    st.rerun()
+                else:
+                    st.error(err)
         done = st.session_state.pop("admin_new_teacher_done", None)
         if done:
             st.success("开通成功，请把下面这组信息发给他（关掉就看不到了，先记下来）")
@@ -1711,6 +1783,8 @@ def page_admin() -> None:
         marks = []
         if entry.get("is_admin"):
             marks.append("管理员")
+        elif entry.get("personal"):
+            marks.append("个人")
         if slug == my_slug:
             marks.append("我")
         title = f"{label}（{username}）· {state}"

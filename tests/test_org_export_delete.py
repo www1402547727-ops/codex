@@ -94,6 +94,13 @@ class OrganizationExportDeleteTests(unittest.TestCase):
     def test_export_contains_only_selected_org_and_each_table_csv(self):
         org_a = self._org_with_members("导出机构甲", ["org_a_admin", "org_a_teacher"])
         org_b = self._org_with_members("导出机构乙", ["org_b_admin"])
+        ok, err = teacher_registry.add_teacher(
+            "personal_teacher",
+            "无机构老师",
+            "personal_teacher",
+            personal=True,
+        )
+        self.assertTrue(ok, err)
         dbs = {
             "org_a_admin": self.base / "a_admin" / "scores.db",
             "org_a_teacher": self.base / "a_teacher" / "scores.db",
@@ -135,6 +142,7 @@ class OrganizationExportDeleteTests(unittest.TestCase):
         self.assertIn("[已隐藏]", users_csv)
         self.assertNotIn("fake-hash", users_csv)
         self.assertFalse(any("org_b_admin" in name for name in names))
+        self.assertFalse(any("personal_teacher" in name for name in names))
         actions = {
             row["action"]
             for row in platform_store.list_audit(org_id=org_a)

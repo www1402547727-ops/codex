@@ -19,6 +19,7 @@ import streamlit as st
 import cloud_store
 import impersonation
 import platform_store
+import teacher_registry
 
 
 DB_PATH = Path(__file__).parent / "data" / "scores.db"
@@ -430,8 +431,9 @@ def create_account_in(
     """
     target = Path(db_path)
     name = str(username or "").strip()
-    if not name:
-        return False, "请填写账号"
+    valid, error = teacher_registry.validate_new_username(name)
+    if not valid:
+        return False, error
     if len(str(password or "")) < 6:
         return False, "初始密码至少 6 位"
     if role not in (ROLE_TEACHER, ROLE_STUDENT):
@@ -930,8 +932,9 @@ def _create_student_account(
     org_id: int | None = None,
 ) -> tuple[bool, str]:
     username = username.strip()
-    if not username:
-        return False, "请填写账号"
+    valid, error = teacher_registry.validate_new_username(username)
+    if not valid:
+        return False, error
     if len(username) < 3:
         return False, "账号至少需要 3 位"
     if len(password) < 8:
@@ -940,7 +943,7 @@ def _create_student_account(
         return False, "学生不存在"
     if not query("SELECT id FROM users WHERE student_id=?", (int(student_id),)).empty:
         return False, "这个学生已经有账号"
-    if not query("SELECT id FROM users WHERE username=?", (username,)).empty:
+    if not query("SELECT id FROM users WHERE username=? COLLATE NOCASE", (username,)).empty:
         return False, "这个账号名已经存在"
     run(
         """INSERT INTO users
