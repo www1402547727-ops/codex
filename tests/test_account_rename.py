@@ -162,6 +162,73 @@ class AccountRenameTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             teacher_registry.update_teacher("default", username="root")
 
+    def test_reconcile_teacher_username_repairs_stale_login_name(self):
+        db = self.data / "scores.db"
+        conn = sqlite3.connect(db)
+        try:
+            conn.execute(
+                """CREATE TABLE user_login_attempts(
+                       id INTEGER PRIMARY KEY,
+                       username TEXT,
+                       attempted_at REAL,
+                       success INTEGER
+                   )"""
+            )
+            conn.execute(
+                "INSERT INTO user_login_attempts(username,attempted_at,success) "
+                "VALUES('allen',1,0)"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        ok, changed, error = um.reconcile_teacher_username("allen", db)
+
+        self.assertTrue(ok, error)
+        self.assertTrue(changed)
+        conn = sqlite3.connect(db)
+        try:
+            row = conn.execute(
+                "SELECT username,password_hash FROM users WHERE role='teacher'"
+            ).fetchone()
+            attempts = conn.execute(
+                "SELECT COUNT(*) FROM user_login_attempts"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(row, ("allen", self.hash))
+        self.assertEqual(attempts, 0)
+
+    def test_reconcile_teacher_username_refuses_multiple_teacher_rows(self):
+        db = self.data / "scores.db"
+        conn = sqlite3.connect(db)
+        try:
+            conn.execute(
+                "INSERT INTO users(username,password_hash,role,org_id) "
+                "VALUES('second',?, 'teacher', 7)",
+                (um.hash_password("second-password"),),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        ok, changed, error = um.reconcile_teacher_username("allen", db)
+
+        self.assertFalse(ok)
+        self.assertFalse(changed)
+        self.assertIn("数量异常", error)
+        conn = sqlite3.connect(db)
+        try:
+            names = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT username FROM users WHERE role='teacher'"
+                ).fetchall()
+            }
+        finally:
+            conn.close()
+        self.assertEqual(names, {"admin", "second"})
+
     def test_personal_teacher_is_not_reattached_to_default_org(self):
         result = account_rename.apply_rename(
             self.data,

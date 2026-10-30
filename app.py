@@ -1834,6 +1834,17 @@ def activate_database(
         )
     except RuntimeError as exc:
         return False, str(exc)
+    expected_username = str(
+        (teacher_registry.teacher_entry(slug) or {}).get("username") or ""
+    ).strip()
+    reconciled, changed, reconcile_error = um.reconcile_teacher_username(
+        expected_username,
+        DB,
+    )
+    if not reconciled:
+        return False, reconcile_error
+    if changed:
+        cloud_store.save_database(DB, cloud_store.db_object_path(slug))
     if not platform_store.is_impersonating():
         st.session_state["auth_db_path"] = str(db)
         st.session_state["auth_db_slug"] = slug

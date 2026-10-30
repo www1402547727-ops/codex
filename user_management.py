@@ -447,6 +447,49 @@ def init_user_db(
         conn.close()
 
 
+def reconcile_teacher_username(
+    expected_username: str,
+    db_path: str | Path | None = None,
+) -> tuple[bool, bool, str]:
+    """让单老师库里的老师登录名与云端名册保持一致。
+
+    返回 ``(是否成功, 是否有改动, 错误信息)``。只修复唯一老师账号的登录名，
+    不改密码、不启用已停用账号；账号数量异常时拒绝自动处理。
+    """
+    expected = str(expected_username or "").strip()
+    if not expected:
+        return True, False, ""
+    conn = _connect(db_path)
+    try:
+        teachers = conn.execute(
+            "SELECT id, username FROM users WHERE role=? ORDER BY id",
+            (ROLE_TEACHER,),
+        ).fetchall()
+        if len(teachers) != 1:
+            return False, False, "老师账号数量异常，无法同步登录名"
+        current = str(teachers[0]["username"] or "").strip()
+        if current == expected:
+            return True, False, ""
+        try:
+            conn.execute(
+                "UPDATE users SET username=? WHERE id=? AND role=?",
+                (expected, int(teachers[0]["id"]), ROLE_TEACHER),
+            )
+            if _has_table(conn, "user_login_attempts"):
+                conn.execute(
+                    "DELETE FROM user_login_attempts "
+                    "WHERE lower(username) IN (lower(?), lower(?))",
+                    (current, expected),
+                )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            return False, False, f"登录名「{expected}」已经被占用"
+        return True, True, ""
+    finally:
+        conn.close()
+
+
 def create_account_in(
     db_path: str | Path,
     username: str,
